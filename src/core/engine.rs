@@ -1088,7 +1088,7 @@ impl LLMEngine {
             if let Some(mtp_tokens) = self.econfig.mtp_num_speculative_tokens {
                 if mtp_tokens > 0 {
                     self.scheduler
-                        .pre_allocate_mtp_blocks(&scheduled_ids, mtp_tokens + 1);
+                        .pre_allocate_spec_blocks(&scheduled_ids, mtp_tokens + 1);
                 }
             }
             // DFlash verify block width is (num_speculative_tokens + 1); reserve it so
@@ -1096,7 +1096,7 @@ impl LLMEngine {
             if let Some(dflash_tokens) = self.econfig.num_speculative_tokens {
                 if dflash_tokens > 0 {
                     self.scheduler
-                        .pre_allocate_mtp_blocks(&scheduled_ids, dflash_tokens + 1);
+                        .pre_allocate_spec_blocks(&scheduled_ids, dflash_tokens + 1);
                 }
             }
         }
@@ -2431,8 +2431,8 @@ impl LLMEngine {
                 // Engine lock released -- server can accept new requests during forward pass
 
                 if let Some((scheduled_ids, is_prefill, owned_seqs)) = prep {
-                    let use_dflash = dflash_enabled && !is_prefill;
-                    let use_mtp = !use_dflash && mtp_enabled && !is_prefill;
+                    let use_dflash = dflash_enabled && !is_prefill && owned_seqs.len() == 1;
+                    let use_mtp = !use_dflash && mtp_enabled && !is_prefill && owned_seqs.len() == 1;
 
                     let forward_result: Result<Vec<Vec<u32>>> = if use_dflash {
                         Self::run_forward_dflash(&runners, &owned_seqs)

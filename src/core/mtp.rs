@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 /// Outcome of MTP verification for a single sequence.
 #[derive(Debug, Clone)]
-pub struct MtpVerifyResult {
+pub struct SpecVerifyResult {
     /// All accepted tokens (draft tokens that matched the target model).
     pub accepted_tokens: Vec<u32>,
     /// The continuation token sampled from the first rejection point.
@@ -51,7 +51,7 @@ pub struct MtpVerifyResult {
 pub fn verify_draft_greedy(
     verify_logits: &Tensor,
     draft_tokens: &[u32],
-) -> Result<MtpVerifyResult> {
+) -> Result<SpecVerifyResult> {
     let num_positions = verify_logits.dim(0)?;
     let num_proposed = draft_tokens.len();
 
@@ -64,7 +64,7 @@ pub fn verify_draft_greedy(
         } else {
             0
         };
-        return Ok(MtpVerifyResult {
+        return Ok(SpecVerifyResult {
             accepted_tokens: vec![],
             continuation_token: first_token,
             num_accepted: 0,
@@ -98,7 +98,7 @@ pub fn verify_draft_greedy(
         target_vec[num_positions - 1]
     };
 
-    Ok(MtpVerifyResult {
+    Ok(SpecVerifyResult {
         accepted_tokens,
         continuation_token,
         num_accepted,
@@ -129,6 +129,128 @@ t += 1;
     Ok(t)
 }
 
+/// Sample a token from a CPU probability vector via a cumsum walk on a uniform coin in [0,1).
+fn categorical_sample(dist: &[f32], coin: f32) -> u32 {
+    let mut cum = 0.0f32;
+    for (i, &p) in dist.iter().enumerate() {
+        cum += p;
+        if coin < cum {
+            return i as u32;
+        }
+    }
+    dist.len().saturating_sub(1) as u32
+}
+
+/// The target sampling distribution (softmax + top-k + top-p) per row, as CPU vectors, for
+/// rejection sampling. One GPU softmax + one D2H transfer; the top-k/top-p masks run on CPU
+/// (correct first port; optimize later).
+fn target_distributions(
+    verify_logits: &Tensor,
+    sampling: &crate::utils::logits_processor::Sampling,
+) -> Result<Vec<Vec<f32>>> {
+    use crate::utils::logits_processor::Sampling;
+    let (k, p, temp) = match sampling {
+        Sampling::All { temperature } => (usize::MAX, 1.0f32, *temperature),
+        Sampling::TopK { k, temperature } => (*k, 1.0, *temperature),
+        Sampling::TopP { p, temperature } => (usize::MAX, *p, *temperature),
+        Sampling::TopKThenTopP { k, p, temperature } => (*k, *p, *temperature),
+        Sampling::ArgMax => (usize::MAX, 1.0, 0.0),
+    };
+    let logits = verify_logits.to_dtype(candle_core::DType::F32)?;
+    let scaled = if temp > 0.0 {
+        logits.broadcast_div(
+            &Tensor::full(temp, logits.shape(), logits.device())?,
+        )?
+    } else {
+        logits
+    };
+    let dist = candle_nn::ops::softmax_last_dim(&scaled)?;
+    let mut dist_cpu = dist.to_vec2::<f32>()?;
+    for row in dist_cpu.iter_mut() {
+        if k < row.len() || p < 1.0 {
+            let mut order: Vec<usize> = (0..row.len()).collect();
+            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+            if k < row.len() {
+                for &i in order.iter().skip(k) {
+                    row[i] = 0.0;
+                }
+            }
+            if p < 1.0 {
+                let mut cum = 0.0f32;
+                let mut keep = 0usize;
+                for &i in order.iter() {
+                    cum += row[i];
+                    keep += 1;
+                    if cum >= p {
+                        break;
+                    }
+                }
+                for &i in order.iter().skip(keep) {
+                    row[i] = 0.0;
+                }
+            }
+            let sum: f32 = row.iter().sum();
+            if sum > 0.0 {
+                for v in row.iter_mut() {
+                    *v /= sum;
+                }
+            }
+        }
+    }
+    Ok(dist_cpu)
+}
+
+/// Rejection-sampling verify for a non-greedy target (temperature > 0). The draft is greedy
+/// (one-hot), so a draft token x is accepted with probability p_target(x); on rejection the
+/// continuation is sampled from (p_target - one_hot(x))^+ (normalized), preserving the target
+/// distribution. Ported from vLLM's chain (topk=1) speculative sampling.
+pub fn verify_draft_rejection(
+    verify_logits: &Tensor,
+    draft_tokens: &[u32],
+    sampling: &crate::utils::logits_processor::Sampling,
+) -> Result<SpecVerifyResult> {
+    use rand::Rng;
+    let k = draft_tokens.len();
+    let dists = target_distributions(verify_logits, sampling)?;
+    let mut rng = rand::rng();
+    let mut accepted = 0usize;
+    let mut continuation = 0u32;
+    for i in 0..k {
+        let dist = &dists[i];
+        let x = draft_tokens[i] as usize;
+        let p_x = dist.get(x).copied().unwrap_or(0.0);
+        let coin: f32 = rng.random_range(0.0..1.0);
+        if coin < p_x {
+            accepted = i + 1;
+        } else {
+            let mut residual = dist.clone();
+            if x < residual.len() {
+                residual[x] = 0.0;
+            }
+            let sum: f32 = residual.iter().sum();
+            if sum > 0.0 {
+                for v in residual.iter_mut() {
+                    *v /= sum;
+                }
+            }
+            continuation = categorical_sample(&residual, rng.random_range(0.0..1.0));
+            break;
+        }
+    }
+    if accepted == k {
+        continuation = categorical_sample(&dists[k], rng.random_range(0.0..1.0));
+    }
+    Ok(SpecVerifyResult {
+        accepted_tokens: draft_tokens[..accepted].to_vec(),
+        continuation_token: continuation,
+        num_accepted: accepted,
+        num_proposed: k,
+        grammar_prefix: k,
+        target_prefix: accepted,
+        continuation_is_ff: false,
+    })
+}
+
 /// Grammar-aware draft verification (the firewall). A draft token is accepted only if BOTH the
 /// target model agrees (argmax) AND the guidance FSM allows it; the continuation is the
 /// FSM-masked target choice (or the grammar-forced token). Non-guided sequences take the fast
@@ -140,7 +262,7 @@ pub fn verify_draft_masked(
     draft_tokens: &[u32],
     guided: &GuidedDecoding,
     seq_id: usize,
-) -> Result<MtpVerifyResult> {
+) -> Result<SpecVerifyResult> {
     let num_proposed = draft_tokens.len();
 
     if !guided.is_guided(seq_id) {
@@ -151,7 +273,7 @@ pub fn verify_draft_masked(
             .to_dtype(candle_core::DType::F32)?
             .argmax(D::Minus1)?
             .to_scalar::<u32>()?;
-        return Ok(MtpVerifyResult {
+        return Ok(SpecVerifyResult {
             accepted_tokens: draft_tokens[..k].to_vec(),
             continuation_token: continuation,
             num_accepted: k,
@@ -183,7 +305,7 @@ pub fn verify_draft_masked(
     //     seq_id, num_proposed, g, t, k, continuation, used_ff, draft_tokens
     // );
 
-    Ok(MtpVerifyResult {
+    Ok(SpecVerifyResult {
         accepted_tokens: draft_tokens[..k].to_vec(),
         continuation_token: continuation,
         num_accepted: k,
@@ -261,7 +383,7 @@ use crate::core::runner::{Model, ModelRunner, Seqs};
 use crate::models::layers::linear::set_linear_is_prefill;
 use attention_rs::InputMetadata;
 
-pub(crate) struct MtpSeqInfo {
+pub(crate) struct SpecSeqInfo {
     pub id: usize,
     pub len: usize,
     pub block_table: Vec<u32>,
@@ -270,7 +392,7 @@ pub(crate) struct MtpSeqInfo {
 impl ModelRunner {
     pub(crate) fn compute_slot_mappings(
         &self,
-        seq_info: &MtpSeqInfo,
+        seq_info: &SpecSeqInfo,
         num_tokens: usize,
         block_size: usize,
         ctx: &str,
@@ -298,7 +420,7 @@ impl ModelRunner {
 
     pub(crate) fn build_mtp_metadata(
         &self,
-        seq_info: &MtpSeqInfo,
+        seq_info: &SpecSeqInfo,
         slot_mappings: &[i64],
         q_len: usize,
     ) -> Result<InputMetadata> {
@@ -335,9 +457,9 @@ impl ModelRunner {
 
             #[cfg(all(feature = "cuda", feature = "graph"))]
             let use_graph = self
-                .mtp_capturer
+                .spec_capturer
                 .as_ref()
-                .map_or(false, |c| c.is_mtp_captured(q_len));
+                .map_or(false, |c| c.is_draft_graph_captured(q_len));
             #[cfg(not(all(feature = "cuda", feature = "graph")))]
             let use_graph = false;
 
@@ -423,9 +545,9 @@ impl ModelRunner {
     /// Batched MTP/DFlash verify metadata: one prefill-style `InputMetadata` covering every
     /// sequence's `[anchor, drafts...]` block. `seqlens` is `None` so the model keeps every row
     /// (speculative verification needs logits for all tokens, not just each sequence's last).
-    pub(crate) fn build_mtp_metadata_batch(
+    pub(crate) fn build_spec_metadata_batch(
         &self,
-        seq_infos: &[MtpSeqInfo],
+        seq_infos: &[SpecSeqInfo],
         slot_mappings: &[Vec<i64>],
         q_lens: &[usize],
     ) -> Result<InputMetadata> {
@@ -591,11 +713,20 @@ impl ModelRunner {
         })
     }
 
-    pub(crate) fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+    pub(crate) fn spec_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+        self.spec_rollback_mamba_at(seq_id, keep_tokens, 0)
+    }
+
+    pub(crate) fn spec_rollback_mamba_at(
+        &self,
+        seq_id: usize,
+        keep_tokens: usize,
+        snapshot_offset: usize,
+    ) -> Result<bool> {
         match self.model() {
-            Model::Qwen3_5(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
-            Model::Qwen3_5MoE(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
-            Model::Qwen3VL(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
+            Model::Qwen3_5(m) => m.spec_rollback_mamba_at(seq_id, keep_tokens, snapshot_offset),
+            Model::Qwen3_5MoE(m) => m.spec_rollback_mamba_at(seq_id, keep_tokens, snapshot_offset),
+            Model::Qwen3VL(m) => m.spec_rollback_mamba_at(seq_id, keep_tokens, snapshot_offset),
             _ => Ok(false),
         }
     }
@@ -605,7 +736,7 @@ impl ModelRunner {
     /// post-norm hidden state is accessible via take_last_hidden_for_mtp),
     /// falling back to eager forward_with_hidden.
     #[allow(unused)]
-    pub(crate) fn mtp_decode_step1(&self, seqs: Seqs, _seq_info: &MtpSeqInfo) -> Result<(u32, Tensor)> {
+    pub(crate) fn mtp_decode_step1(&self, seqs: Seqs, _seq_info: &SpecSeqInfo) -> Result<(u32, Tensor)> {
         let (input_ids, positions, mut input_metadata) = match &seqs {
             Seqs::SeqRefs(seqs_ref) => self.prepare_decode(*seqs_ref)?,
             Seqs::DecodeVec(decode_seqs) => self.prepare_decode(decode_seqs.iter())?,
@@ -779,19 +910,20 @@ impl ModelRunner {
         let _prefill_guard = set_linear_is_prefill(true);
         #[cfg(all(feature = "cuda", feature = "graph"))]
         let use_mtp_graph = self
-            .mtp_capturer
+            .spec_capturer
             .as_ref()
-            .map_or(false, |c| c.is_mtp_captured(verify_len));
+            .map_or(false, |c| c.is_draft_graph_captured(verify_len));
         #[cfg(not(all(feature = "cuda", feature = "graph")))]
         let use_mtp_graph = false;
 
         let result = if use_mtp_graph {
             #[cfg(all(feature = "cuda", feature = "graph"))]
             {
-                self.mtp_capturer.as_ref().unwrap().replay_mtp(
+                self.spec_capturer.as_ref().unwrap().replay_draft_graph(
                     verify_ids,
                     verify_positions,
                     metadata,
+                    self.spec_drafter_name(),
                 )
             }
             #[cfg(not(all(feature = "cuda", feature = "graph")))]
@@ -840,10 +972,10 @@ impl ModelRunner {
                 return Ok(output.into_iter().map(|t| vec![t]).collect());
             }
         };
-        let seq_infos: Vec<MtpSeqInfo> = match &seqs {
+        let seq_infos: Vec<SpecSeqInfo> = match &seqs {
             Seqs::SeqRefs(s) => s
                 .iter()
-                .map(|seq| MtpSeqInfo {
+                .map(|seq| SpecSeqInfo {
                     id: seq.id,
                     len: seq.len(),
                     block_table: seq.block_table.clone(),
@@ -851,7 +983,7 @@ impl ModelRunner {
                 .collect(),
             Seqs::DecodeVec(d) => d
                 .iter()
-                .map(|ds| MtpSeqInfo {
+                .map(|ds| SpecSeqInfo {
                     id: ds.id,
                     len: ds.len,
                     block_table: ds.block_tables.clone(),
@@ -859,13 +991,13 @@ impl ModelRunner {
                 .collect(),
         };
         let any_guided = seq_infos.iter().any(|si| self.guided_decoding.is_guided(si.id));
-        if seq_infos.len() > 1 && !any_guided {
-            return self.run_mtp_decode_batch(seqs, &seq_infos, head);
-        }
         let drafter = MtpDrafter {
-            head,
-            num_spec: self.mtp_num_speculative,
+            head: head.clone(),
+            num_spec: self.spec_num_tokens,
         };
+        if seq_infos.len() > 1 && !any_guided {
+            return self.run_mtp_decode_batch(seqs, &seq_infos, head, drafter.name());
+        }
         self.run_spec_decode(seqs, &drafter)
     }
 
@@ -875,8 +1007,9 @@ impl ModelRunner {
     fn run_mtp_decode_batch(
         &self,
         seqs: Seqs,
-        seq_infos: &[MtpSeqInfo],
+        seq_infos: &[SpecSeqInfo],
         mtp_head: Arc<Qwen3_5MtpHead>,
+        name: &'static str,
     ) -> Result<Vec<Vec<u32>>> {
         let embed_weight = match self.model() {
             Model::Qwen3_5(m) => m.embed_weight().clone(),
@@ -913,7 +1046,7 @@ impl ModelRunner {
             let (draft, _) = mtp_head.draft_tokens_gpu(
                 &seq_hidden,
                 &known_tokens,
-                self.mtp_num_speculative,
+                self.spec_num_tokens,
                 &embed_weight,
                 &lm_head_fn,
                 base_position,
@@ -926,7 +1059,7 @@ impl ModelRunner {
             return Ok(anchors.into_iter().map(|anchor| vec![anchor]).collect());
         }
 
-        let verify_len = self.mtp_num_speculative + 1;
+        let verify_len = self.spec_num_tokens + 1;
         let mut verify_tokens = Vec::with_capacity(seq_infos.len() * verify_len);
         let mut slot_mappings = Vec::with_capacity(seq_infos.len());
         for (seq_info, (anchor, draft)) in seq_infos.iter().zip(anchors.iter().zip(&draft_tokens)) {
@@ -940,7 +1073,7 @@ impl ModelRunner {
             )?);
         }
         let q_lens = vec![verify_len; seq_infos.len()];
-        let verify_metadata = self.build_mtp_metadata_batch(seq_infos, &slot_mappings, &q_lens)?;
+        let verify_metadata = self.build_spec_metadata_batch(seq_infos, &slot_mappings, &q_lens)?;
         let verify_input_ids = Tensor::from_vec(
             verify_tokens,
             (seq_infos.len() * verify_len,),
@@ -993,7 +1126,7 @@ impl ModelRunner {
             let verify_result = verify_draft_greedy(&logits, draft)?;
             if verify_result.num_accepted < verify_result.num_proposed {
                 let keep_tokens = 1 + verify_result.num_accepted;
-                if !self.mtp_rollback_mamba(seq_info.id, keep_tokens)? {
+                if !self.spec_rollback_mamba_at(seq_info.id, keep_tokens, offset)? {
                     candle_core::bail!(
                         "MTP failed to roll back mamba-state for batch sequence {}",
                         seq_info.id
@@ -1004,7 +1137,7 @@ impl ModelRunner {
             result.push(anchors[index]);
             result.extend_from_slice(&verify_result.accepted_tokens);
             result.push(verify_result.continuation_token);
-            crate::core::speculative::spec_stats_update("mtp", seq_info.id, &verify_result);
+            crate::core::speculative::spec_stats_update(name, seq_info.id, &verify_result);
             outputs.push(result);
         }
         Ok(outputs)
@@ -1019,12 +1152,18 @@ pub struct MtpDrafter {
     num_spec: usize,
 }
 
+impl MtpDrafter {
+    pub fn new(head: Arc<Qwen3_5MtpHead>, num_spec: usize) -> Self {
+        Self { head, num_spec }
+    }
+}
+
 impl Drafter for MtpDrafter {
     fn name(&self) -> &'static str {
-        "mtp"
+        "MTP"
     }
 
-    fn anchor(&self, runner: &ModelRunner, seqs: Seqs, seq: &MtpSeqInfo) -> Result<(u32, Option<Tensor>)> {
+    fn anchor(&self, runner: &ModelRunner, seqs: Seqs, seq: &SpecSeqInfo) -> Result<(u32, Option<Tensor>)> {
         // Step 1: main-model decode for the anchor + hidden state.
         let (anchor_token, seq_hidden) = runner.mtp_decode_step1(seqs, seq)?;
         Ok((anchor_token, Some(seq_hidden)))
@@ -1033,7 +1172,7 @@ impl Drafter for MtpDrafter {
     fn draft(
         &self,
         runner: &ModelRunner,
-        seq: &MtpSeqInfo,
+        seq: &SpecSeqInfo,
         anchor: u32,
         hidden: &Option<Tensor>,
     ) -> Result<Vec<u32>> {
@@ -1060,12 +1199,14 @@ impl Drafter for MtpDrafter {
         };
         let base_position = seq.len.saturating_sub(1);
         let known_tokens: Vec<u32> = vec![anchor];
+        // Adaptive K: scale the draft count down as the KV context grows (verify is O(ctx*K)).
+        let k = crate::core::speculative::adaptive_speculative_tokens(seq.len, self.num_spec);
         if runner.guided_decoding.is_guided(seq.id) {
             // Grammar-aware: produce the draft logits, then bias the picks toward FSM-legal tokens.
             let logits = self.head.draft_logits_gpu(
                 seq_hidden,
                 &known_tokens,
-                self.num_spec,
+                k,
                 &embed_weight,
                 lm_head_fn,
                 base_position,
@@ -1082,7 +1223,7 @@ impl Drafter for MtpDrafter {
         let (draft_tokens, _last_hidden) = self.head.draft_tokens_gpu(
             seq_hidden,
             &known_tokens,
-            self.num_spec,
+            k,
             &embed_weight,
             lm_head_fn,
             base_position,

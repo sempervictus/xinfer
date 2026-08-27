@@ -707,7 +707,7 @@ impl Scheduler {
     /// Pre-allocate KV cache blocks for MTP speculative tokens.
     /// Called before MTP runs to ensure the verification forward has room
     /// to write KV for speculative positions.
-    pub fn pre_allocate_mtp_blocks(&mut self, ids: &[usize], extra_tokens: usize) {
+    pub fn pre_allocate_spec_blocks(&mut self, ids: &[usize], extra_tokens: usize) {
         for &idx in ids {
             if idx >= self.running.len() {
                 continue;

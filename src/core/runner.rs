@@ -39,6 +39,7 @@ use crate::{
     utils::config::{Config, EngineConfig, ModelType, SamplingParams},
     utils::kvcache_allocator::{hybrid_mamba_graph_capture_max_batch, KVCacheAllocator},
 };
+use crate::core::speculative::Drafter;
 use attention_rs::cache;
 #[cfg(feature = "flashinfer")]
 use attention_rs::FlashInferMetadata;
@@ -137,11 +138,11 @@ pub struct ModelRunner {
     #[cfg(all(feature = "cuda", feature = "graph"))]
     pub decode_capturer: GraphCapturer<CudaGraphWrapper<CudaGraphFn>>,
     #[cfg(all(feature = "cuda", feature = "graph"))]
-    pub mtp_capturer: Option<GraphCapturer<CudaGraphWrapper<CudaGraphFn>>>,
+    pub spec_capturer: Option<GraphCapturer<CudaGraphWrapper<CudaGraphFn>>>,
     #[cfg(feature = "flashinfer")]
     pub(crate) flashinfer_kv_params: Option<FlashInferKvParams>,
     logit_processor: LogitsProcessor,
-    cached_sampling: RwLock<Option<CachedSamplingParams>>,
+    pub(crate) cached_sampling: RwLock<Option<CachedSamplingParams>>,
     seq_tokens: RwLock<HashMap<usize, Vec<u32>>>,
     restored_prefix_sequences: RwLock<HashSet<usize>>,
     pub(crate) guided_decoding: GuidedDecoding,
@@ -151,9 +152,12 @@ pub struct ModelRunner {
     /// MTP head for speculative decoding (Qwen3.5 only for now)
     pub(crate) mtp_head: Option<Arc<Qwen3_5MtpHead>>,
     /// Number of speculative tokens to draft per step
-    pub(crate) mtp_num_speculative: usize,
+    pub(crate) spec_num_tokens: usize,
     /// DFlash drafter (separate replicated draft model) for speculative decoding.
     pub(crate) dflash_drafter: Option<Arc<crate::core::dflash_drafter::DFlashDrafter>>,
+    /// Opt-in CUDA graph for the DFlash draft transformer (`XINFER_DFLASH_DRAFT_GRAPH`).
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    pub(crate) dflash_draft_graph: Option<crate::utils::graph::DFlashDraftGraph>,
 }
 
 impl ModelRunner {
@@ -296,6 +300,16 @@ impl ModelRunner {
         config.dflash_enabled = econfig.draft_model_id.is_some()
             || econfig.draft_model_path.is_some();
 
+        // Size GDN MTP/DFlash snapshot buffers for worst-case packed verify:
+        // max_num_seqs * (speculative_tokens + 1).
+        if config.mtp_enabled || config.dflash_enabled {
+            let external_num_spec = econfig.num_speculative_tokens.unwrap_or(0);
+            let spec_tokens = requested_mtp_num_speculative.max(external_num_spec).max(1);
+            let max_seqs = econfig.max_num_parallel_reqs.max(1);
+            config.mtp_max_verify_tokens =
+                max_seqs.saturating_mul(spec_tokens.saturating_add(1));
+        }
+
         let model = crate::build_model!(
             model_type,
             vb,
@@ -354,9 +368,9 @@ impl ModelRunner {
         );
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        let mtp_wrapper = if econfig.mtp_num_speculative_tokens.unwrap_or(0) > 0
+        let spec_wrapper = if econfig.mtp_num_speculative_tokens.unwrap_or(0) > 0
             || (config.dflash_enabled && econfig.num_speculative_tokens.unwrap_or(0) > 0)
-        {
+{
             Some(crate::graph_wrapper!(
                 &model,
                 device,
@@ -659,7 +673,17 @@ impl ModelRunner {
             );
         }
 
-        let (mtp_head, mut mtp_num_speculative) = if let Some(num_spec) =
+        // MTP and DFlash are mutually exclusive: if both are requested at startup, bail.
+        let dflash_requested =
+            econfig.draft_model_id.is_some() || econfig.draft_model_path.is_some();
+        if requested_mtp_num_speculative > 0 && dflash_requested {
+            candle_core::bail!(
+                "Cannot enable both MTP (--mtp {}) and DFlash (draft model) speculative decoding; choose one",
+                requested_mtp_num_speculative
+            );
+        }
+
+        let (mtp_head, mut spec_num_tokens) = if let Some(num_spec) =
             econfig.mtp_num_speculative_tokens
         {
             if requested_mtp_num_speculative == 0 {
@@ -708,12 +732,12 @@ impl ModelRunner {
         };
 
         let dflash_drafter = Self::init_dflash_drafter(econfig, comm.clone(), &device)?;
-        // DFlash reuses the MTP verify CUDA-graph capturer. When only DFlash is enabled,
-        // borrow `mtp_num_speculative` for capture/replay sizing, and preallocate the
-        // graph-safe per-layer hidden buffers (written during `is_mtp_verify` forwards).
-        if mtp_num_speculative == 0 {
+        // DFlash reuses the MTP verify CUDA-graph capturer (the author's graph verification).
+        // When only DFlash is enabled, borrow `spec_num_tokens` for capture/replay sizing,
+        // and preallocate the graph-safe per-layer hidden buffers (written during `is_mtp_verify`).
+        if spec_num_tokens == 0 {
             if let Some(drafter) = dflash_drafter.as_ref() {
-                mtp_num_speculative = drafter.num_speculative_tokens;
+                spec_num_tokens = drafter.num_speculative_tokens;
             }
         }
         if let Some(drafter) = dflash_drafter.as_ref() {
@@ -728,6 +752,21 @@ impl ModelRunner {
                 _ => {}
             }
         }
+
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        let dflash_draft_graph = if crate::utils::env::dflash_draft_graph() {
+            if let Some(drafter) = dflash_drafter.as_ref() {
+                let cap = crate::utils::env::dflash_context_window().max(1);
+                let block = drafter.num_speculative() + 1;
+                let hidden = drafter.draft_model.config.hidden_size;
+                let dtype = drafter.draft_model.dtype();
+                Some(crate::utils::graph::DFlashDraftGraph::new(cap, block, hidden, dtype, &device)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             model,
@@ -751,7 +790,7 @@ impl ModelRunner {
                 ),
             ),
             #[cfg(all(feature = "cuda", feature = "graph"))]
-            mtp_capturer: mtp_wrapper.map(|w| {
+            spec_capturer: spec_wrapper.map(|w| {
                 GraphCapturer::new(
                     w,
                     graph_capture_max_num_seqs,
@@ -777,8 +816,10 @@ impl ModelRunner {
             is_first_rank: comm.rank() == 0,
             model_type,
             mtp_head,
-            mtp_num_speculative,
+            spec_num_tokens,
             dflash_drafter,
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            dflash_draft_graph,
         })
     }
 
@@ -842,7 +883,7 @@ impl ModelRunner {
         num_speculative: usize,
     ) -> Result<()> {
         self.mtp_head = Some(mtp_head);
-        self.mtp_num_speculative = num_speculative;
+        self.spec_num_tokens = num_speculative;
         crate::log_info!(
             "MTP initialized: {} speculative tokens per step",
             num_speculative,
@@ -851,7 +892,21 @@ impl ModelRunner {
     }
 
     pub fn has_mtp(&self) -> bool {
-        self.mtp_head.is_some() && self.mtp_num_speculative > 0
+        self.mtp_head.is_some() && self.spec_num_tokens > 0
+    }
+
+    /// The active spec drafter's name ("mtp", "dflash1", "dflash2"), or "none".
+    /// Mirrors `Drafter::name()`; DFlash takes priority over MTP (matches the engine dispatch).
+    pub(crate) fn spec_drafter_name(&self) -> &'static str {
+        if let Some(d) = self.dflash_drafter.as_ref() {
+            return d.name();
+        }
+        if let Some(head) = self.mtp_head.clone() {
+            if self.spec_num_tokens > 0 {
+                return crate::core::mtp::MtpDrafter::new(head, self.spec_num_tokens).name();
+            }
+        }
+        "none"
     }
 
     pub fn get_kv_cache(&self) -> MutexGuard<'_, GpuKvCache> {
@@ -1929,6 +1984,9 @@ impl ModelRunner {
         let mut restored = self.restored_prefix_sequences.write();
         let _ = restored.remove(&id);
         self.guided_decoding.finish(id);
+        if let Some(drafter) = self.dflash_drafter.as_ref() {
+            drafter.clear(id);
+        }
         // Clean up the per-seq spec stats (the server displays them via the cross-process fetch).
         let _ = crate::core::speculative::spec_seq_report(id);
         match &self.model {
@@ -1976,14 +2034,26 @@ impl ModelRunner {
         let kv_pairs = kv_cache_lock.as_pairs();
         self.decode_capturer.capture(&self.device, kv_pairs)?;
 
-        if self.mtp_num_speculative > 0 {
+        if self.spec_num_tokens > 0 {
             // self.decode_capturer.model.sync()?;
-            if let Some(mtp_cap) = &mut self.mtp_capturer {
+            let name = self.spec_drafter_name();
+            if let Some(spec_cap) = &mut self.spec_capturer {
                 crate::log_info!(
-                    "Capturing MTP verify graphs for up to {} draft tokens...",
-                    self.mtp_num_speculative
+                    "Capturing {} verify graphs for up to {} draft tokens...",
+                    name,
+                    self.spec_num_tokens
                 );
-                mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;
+                spec_cap.capture_draft_graph(&self.device, kv_pairs, self.spec_num_tokens, name)?;
+            }
+        }
+
+        // Opt-in DFlash draft graph (XINFER_DFLASH_DRAFT_GRAPH): capture the draft transformer.
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        if let Some(graph) = self.dflash_draft_graph.as_mut() {
+            if let Some(drafter) = self.dflash_drafter.as_ref() {
+                let dm = &drafter.draft_model;
+                crate::log_info!("Capturing DFlash draft graph...");
+                graph.capture(|th, ne, pos| dm.forward(th, ne, pos))?;
             }
         }
 

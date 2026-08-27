@@ -679,14 +679,10 @@ impl Qwen3_5MoEForCausalLM {
         target_layer_ids: &[usize],
         max_verify_len: usize,
     ) -> Result<()> {
-        let buf_dtype = if self.is_qvar_builder
-            || self.config.quant.is_some()
-            || self.config.higher_precision_required()
-        {
-            DType::F32
-        } else {
-            self.dtype
-        };
+        // Match the residual-stream dtype exactly (== self.dtype) so the in-graph copy is a
+        // direct memcpy with NO to_dtype temp (a graph-pool temp interleaved with the flash
+        // kernel is the SM120 IMA source under AUTO_FREE_ON_LAUNCH).
+        let buf_dtype = self.dtype;
         let mut buffers = Vec::with_capacity(target_layer_ids.len());
         for _ in target_layer_ids {
             buffers.push(Tensor::zeros(
@@ -1059,7 +1055,16 @@ impl Qwen3_5MoEForCausalLM {
         self.mamba_cache.write().restore_prefix_state(seq_id, hash)
     }
 
-    pub fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+    pub fn spec_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+        self.spec_rollback_mamba_at(seq_id, keep_tokens, 0)
+    }
+
+    pub fn spec_rollback_mamba_at(
+        &self,
+        seq_id: usize,
+        keep_tokens: usize,
+        snapshot_offset: usize,
+    ) -> Result<bool> {
         let mut mamba_cache = self.mamba_cache.write();
 
         let slots = mamba_cache
@@ -1070,7 +1075,12 @@ impl Qwen3_5MoEForCausalLM {
         let seq_slots = Tensor::from_vec(slots, (1,), &self.device)?;
         for layer in &self.layers {
             if let Qwen3_5MoEAttnType::LinearAttention(gdn) = &layer.attn {
-                gdn.rollback_mtp_verify(&mut mamba_cache, &seq_slots, keep_tokens)?;
+                gdn.rollback_mtp_verify_at(
+                    &mut mamba_cache,
+                    &seq_slots,
+                    keep_tokens,
+                    snapshot_offset,
+                )?;
             }
         }
         Ok(true)

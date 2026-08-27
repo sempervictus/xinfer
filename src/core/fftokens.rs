@@ -8,7 +8,7 @@
 //
 // use candle_core::{Result, Tensor};
 //
-// use crate::core::mtp::MtpSeqInfo;
+// use crate::core::mtp::SpecSeqInfo;
 // use crate::core::runner::{ModelRunner, Seqs};
 // use crate::core::speculative::Drafter;
 //
@@ -20,7 +20,7 @@
 //         "ff"
 //     }
 //
-//     fn anchor(&self, runner: &ModelRunner, seqs: Seqs, _seq: &MtpSeqInfo) -> Result<(u32, Option<Tensor>)> {
+//     fn anchor(&self, runner: &ModelRunner, seqs: Seqs, _seq: &SpecSeqInfo) -> Result<(u32, Option<Tensor>)> {
 //         // Plain (grammar-aware) decode step: the anchor token.
 //         let anchor = runner.run(seqs, false)?[0];
 //         Ok((anchor, None))
@@ -29,7 +29,7 @@
 //     fn draft(
 //         &self,
 //         _runner: &ModelRunner,
-//         _seq: &MtpSeqInfo,
+//         _seq: &SpecSeqInfo,
 //         _anchor: u32,
 //         _hidden: &Option<Tensor>,
 //     ) -> Result<Vec<u32>> {

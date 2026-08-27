@@ -22,6 +22,15 @@ pub struct DFlashDrafter {
 }
 
 impl DFlashDrafter {
+    /// The drafter's unique name for stats/logging: "DFlash1" or "DFlash2".
+    pub fn name(&self) -> &'static str {
+        if self.draft_model.config.has_v2_components() {
+            "DFlash2"
+        } else {
+            "DFlash1"
+        }
+    }
+
     pub fn new(
         draft_config: &DFlashModelConfig,
         draft_vb: &VarBuilderX,
@@ -184,6 +193,68 @@ impl DFlashDrafter {
             self.draft_model
                 .forward(&target_hidden_cast, &noise_2d, &positions_tensor)?;
         self.draft_model.draft_logits(&draft_hidden, n_mask, lm_head_fn)
+    }
+
+    /// Build the draft block inputs (eager): the cast target context, the noise embeddings
+    /// (`[anchor, MASK x n]` via the target embed table), and the 0-based positions.
+    pub fn build_draft_inputs(
+        &self,
+        target_hidden: &Tensor,
+        embed_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
+        anchor: u32,
+        n_mask: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let dtype = self.draft_model.dtype();
+        let mut block_ids = Vec::with_capacity(1 + n_mask);
+        block_ids.push(anchor);
+        block_ids.extend(std::iter::repeat(self.mask_token_id).take(n_mask));
+        let block_len = block_ids.len();
+        let block_tensor = Tensor::from_vec(
+            block_ids.iter().map(|&x| x as i64).collect::<Vec<_>>(),
+            (block_len,),
+            &self.device,
+        )?;
+        let noise_embedding = embed_fn(&block_tensor)?.to_dtype(dtype)?;
+        let target_hidden_2d = if target_hidden.rank() == 3 {
+            let (_, ctx, h) = target_hidden.dims3()?;
+            target_hidden.reshape((ctx, h))?
+        } else {
+            target_hidden.clone()
+        };
+        let target_hidden_cast = target_hidden_2d.to_dtype(dtype)?;
+        let noise_2d = if noise_embedding.rank() == 3 {
+            let (_, s, h) = noise_embedding.dims3()?;
+            noise_embedding.reshape((s, h))?
+        } else {
+            noise_embedding
+        };
+        let total_len = target_hidden_cast.dim(0)? + block_len;
+        let positions = Tensor::from_vec(
+            (0..total_len as i64).collect::<Vec<_>>(),
+            (total_len,),
+            &self.device,
+        )?;
+        Ok((target_hidden_cast, noise_2d, positions))
+    }
+
+    /// Run the draft transformer (graphable). Returns draft_hidden `[ctx + block, hidden]`.
+    pub fn draft_forward(
+        &self,
+        target_hidden: &Tensor,
+        noise_embedding: &Tensor,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        self.draft_model.forward(target_hidden, noise_embedding, positions)
+    }
+
+    /// The target lm_head logits over the trailing `n_mask` draft positions (eager).
+    pub fn lm_head_logits(
+        &self,
+        draft_hidden: &Tensor,
+        n_mask: usize,
+        lm_head_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        self.draft_model.draft_logits(draft_hidden, n_mask, lm_head_fn)
     }
 
     /// Select draft tokens from pre-computed logits (DFlash2 selector, else argmax).

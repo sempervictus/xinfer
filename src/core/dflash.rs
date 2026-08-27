@@ -10,7 +10,7 @@ use std::sync::Arc;
 use candle_core::{Result, Tensor};
 
 use crate::core::dflash_drafter::DFlashDrafter;
-use crate::core::mtp::MtpSeqInfo;
+use crate::core::mtp::SpecSeqInfo;
 use crate::core::runner::{Model, ModelRunner, Seqs};
 use crate::core::speculative::{Drafter, Proposal};
 use crate::models::layers::linear::set_linear_is_prefill;
@@ -24,18 +24,14 @@ pub struct DflashDrafter {
 
 impl Drafter for DflashDrafter {
     fn name(&self) -> &'static str {
-        if self.inner.draft_model.config.has_v2_components() {
-            "dflash2"
-        } else {
-            "dflash1"
-        }
+        self.inner.name()
     }
 
     fn verify_target_layers(&self) -> &[usize] {
         self.inner.target_layer_ids()
     }
 
-    fn anchor(&self, runner: &ModelRunner, seqs: Seqs, seq: &MtpSeqInfo) -> Result<(u32, Option<Tensor>)> {
+    fn anchor(&self, runner: &ModelRunner, seqs: Seqs, seq: &SpecSeqInfo) -> Result<(u32, Option<Tensor>)> {
         let seq_id = seq.id;
         let target_layer_ids = self.inner.target_layer_ids();
 
@@ -147,7 +143,7 @@ impl Drafter for DflashDrafter {
     fn draft(
         &self,
         runner: &ModelRunner,
-        seq: &MtpSeqInfo,
+        seq: &SpecSeqInfo,
         anchor: u32,
         _hidden: &Option<Tensor>,
     ) -> Result<Vec<u32>> {
@@ -185,13 +181,36 @@ impl Drafter for DflashDrafter {
                 return Ok(vec![]);
             }
         };
-        let n_mask = self.inner.num_speculative();
+        let n_mask = crate::core::speculative::adaptive_speculative_tokens(seq.len, self.inner.num_speculative());
         if n_mask == 0 {
             // crate::log_info!("[dflash-debug] draft: seq={} n_mask=0 -> no drafts", seq_id);
             return Ok(vec![]);
         }
-        let (logits, hidden_n) =
-            self.inner.draft_logits(&ctx, &embed_fn, &lm_head_fn, anchor, n_mask)?;
+        let (th_cast, noise_2d, positions) =
+            self.inner.build_draft_inputs(&ctx, &embed_fn, anchor, n_mask)?;
+        let draft_hidden = {
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            {
+                if let Some(graph) = runner
+                    .dflash_draft_graph
+                    .as_ref()
+                    .filter(|g| g.is_captured())
+                {
+                    if th_cast.dim(0)? == graph.cap() {
+                        graph.replay(&th_cast, &noise_2d, &positions)?
+                    } else {
+                        self.inner.draft_forward(&th_cast, &noise_2d, &positions)?
+                    }
+                } else {
+                    self.inner.draft_forward(&th_cast, &noise_2d, &positions)?
+                }
+            }
+            #[cfg(not(all(feature = "cuda", feature = "graph")))]
+            {
+                self.inner.draft_forward(&th_cast, &noise_2d, &positions)?
+            }
+        };
+        let (logits, hidden_n) = self.inner.lm_head_logits(&draft_hidden, n_mask, &lm_head_fn)?;
 
         // v2 (fused CUDA kernels): grammar gating is applied *inside* the candidate-walk
         // kernel via a per-position allow matrix. Static repeated VOB by default; the exact
@@ -253,7 +272,7 @@ impl Drafter for DflashDrafter {
     fn on_verified(
         &self,
         _runner: &ModelRunner,
-        seq: &MtpSeqInfo,
+        seq: &SpecSeqInfo,
         _proposal: &Proposal,
         vhidden: &[Tensor],
         accepted: usize,
@@ -270,13 +289,11 @@ impl Drafter for DflashDrafter {
         Ok(())
     }
 
-    /// Verify forward: CUDA-graph replay when captured (hybrid models), else eager.
-    ///
-    /// The graph-safe per-layer hidden buffers are written by the `forward_inner` copy block
-    /// DURING the replayed graph, so the order is: `replay_mtp` (writes buffers) ->
+    /// Verify forward: CUDA-graph replay when captured (the author's graph verification), else
+    /// eager. The graph-safe per-layer hidden buffers are written by the `forward_inner` copy
+    /// block DURING the replayed graph, so the order is: `replay_draft_graph` (writes buffers) ->
     /// `take_dflash_verify_hiddens` (reads buffers). Both DFlash v1 and v2 use the identical
-    /// target-verify graph (the drafter version only affects the eager draft step), so this is
-    /// variety-agnostic.
+    /// target-verify graph (the drafter version only affects the eager draft step).
     fn verify_forward(
         &self,
         runner: &ModelRunner,
@@ -291,15 +308,15 @@ impl Drafter for DflashDrafter {
             runner.model(),
             Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen3VL(_)
         ) && runner
-            .mtp_capturer
+            .spec_capturer
             .as_ref()
-            .is_some_and(|c| c.is_mtp_captured(verify_len))
+            .is_some_and(|c| c.is_draft_graph_captured(verify_len))
         {
             let logits = runner
-                .mtp_capturer
+                .spec_capturer
                 .as_ref()
                 .unwrap()
-                .replay_mtp(verify_ids, verify_positions, metadata)?;
+                .replay_draft_graph(verify_ids, verify_positions, metadata, self.name())?;
             let layer_hiddens = match runner.model() {
                 Model::Qwen3_5(m) => m.take_dflash_verify_hiddens(verify_len),
                 Model::Qwen3_5MoE(m) => m.take_dflash_verify_hiddens(verify_len),
@@ -364,10 +381,10 @@ impl ModelRunner {
         drafter: &DflashDrafter,
     ) -> Result<Vec<Vec<u32>>> {
         let inner = &drafter.inner;
-        let seq_infos: Vec<MtpSeqInfo> = match &seqs {
+        let seq_infos: Vec<SpecSeqInfo> = match &seqs {
             Seqs::SeqRefs(refs) => refs
                 .iter()
-                .map(|s| MtpSeqInfo {
+                .map(|s| SpecSeqInfo {
                     id: s.id,
                     len: s.len(),
                     block_table: s.block_table.clone(),
@@ -375,7 +392,7 @@ impl ModelRunner {
                 .collect(),
             Seqs::DecodeVec(d) => d
                 .iter()
-                .map(|s| MtpSeqInfo {
+                .map(|s| SpecSeqInfo {
                     id: s.id,
                     len: s.len,
                     block_table: s.block_tables.clone(),
@@ -485,7 +502,7 @@ impl ModelRunner {
             (seq_infos.len() * verify_len,),
             self.device(),
         )?;
-        let verify_metadata = self.build_mtp_metadata_batch(&seq_infos, &slot_mappings, &q_lens)?;
+        let verify_metadata = self.build_spec_metadata_batch(&seq_infos, &slot_mappings, &q_lens)?;
         let _verify_guard = set_linear_is_prefill(true);
         let kv_cache = self.get_kv_cache();
         let kv_pairs = kv_cache.as_pairs();
@@ -511,7 +528,7 @@ impl ModelRunner {
             let res = crate::core::mtp::verify_draft_greedy(&per_seq_logits, d)?;
             let commit_len = 1 + res.num_accepted;
             if res.num_accepted < res.num_proposed {
-                self.mtp_rollback_mamba(si.id, commit_len)?;
+                self.spec_rollback_mamba_at(si.id, commit_len, offset)?;
             }
             let vproj_row = verify_projected.narrow(0, offset, verify_len)?;
             let keep = std::cmp::min(res.num_accepted + 1, vproj_row.dim(0)?);

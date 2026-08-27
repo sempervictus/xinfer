@@ -195,3 +195,55 @@ pub fn dflash_context_window() -> usize {
             .unwrap_or(4096)  // Default: 4096 (matches DFlash2 training window)
     })
 }
+
+/// Enable adaptive speculative draft count: scale K down as the KV context grows (the verify
+/// forward costs O(ctx * K), so a large K is net-negative at long context). Default on.
+/// Set `XINFER_SPEC_ADAPTIVE_K=0` to force the configured (fixed) K.
+pub const SPEC_ADAPTIVE_K_ENV: &str = "XINFER_SPEC_ADAPTIVE_K";
+
+static SPEC_ADAPTIVE_K: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_adaptive_k() -> bool {
+    *SPEC_ADAPTIVE_K.get_or_init(|| {
+        !matches!(
+            env::var(SPEC_ADAPTIVE_K_ENV)
+                .ok()
+                .as_deref()
+                .map(|v| v.trim().eq_ignore_ascii_case("0") || v.trim().eq_ignore_ascii_case("false")),
+            Some(true)
+        )
+    })
+}
+
+/// Reference context length (tokens) at which the full base K is used; beyond it, K scales down
+/// proportionally (`K * ref_ctx / ctx`), floored at 1. Default 1048576.
+pub const SPEC_ADAPTIVE_REF_CTX_ENV: &str = "XINFER_SPEC_ADAPTIVE_REF_CTX";
+
+static SPEC_ADAPTIVE_REF_CTX: OnceLock<usize> = OnceLock::new();
+
+pub fn spec_adaptive_ref_ctx() -> usize {
+    *SPEC_ADAPTIVE_REF_CTX.get_or_init(|| {
+        env::var(SPEC_ADAPTIVE_REF_CTX_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1048576)
+    })
+}
+
+/// Opt-out: capture the DFlash draft transformer into a CUDA graph (replayed when the context
+/// window is full). Default ON; set `XINFER_DFLASH_DRAFT_GRAPH=0` to force the eager draft.
+pub const DFLASH_DRAFT_GRAPH_ENV: &str = "XINFER_DFLASH_DRAFT_GRAPH";
+
+static DFLASH_DRAFT_GRAPH: OnceLock<bool> = OnceLock::new();
+
+pub fn dflash_draft_graph() -> bool {
+    *DFLASH_DRAFT_GRAPH.get_or_init(|| {
+        !matches!(
+            env::var(DFLASH_DRAFT_GRAPH_ENV)
+                .ok()
+                .as_deref()
+                .map(|v| v.trim().eq_ignore_ascii_case("0") || v.trim().eq_ignore_ascii_case("false")),
+            Some(true)
+        )
+    })
+}

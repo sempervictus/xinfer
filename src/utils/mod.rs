@@ -758,6 +758,7 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
         mtp_use_dedicated_embeddings: None,
         mtp_enabled: false,
         dflash_enabled: false,
+        mtp_max_verify_tokens: 0,
         expert_dtype: None,
     };
 
@@ -2664,6 +2665,7 @@ mod tests {
             mtp_use_dedicated_embeddings: None,
             mtp_enabled: false,
             dflash_enabled: false,
+            mtp_max_verify_tokens: 0,
             expert_dtype: None,
         }
     }

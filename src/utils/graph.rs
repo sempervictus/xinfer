@@ -375,7 +375,7 @@ pub struct GraphCaptureVars {
     pub outputs: BTreeMap<usize, Tensor>,
 }
 
-pub struct MtpGraphCaptureVars {
+pub struct SpecGraphCaptureVars {
     pub input_ids: Tensor,
     pub positions: Tensor,
     pub mamba_slot_mapping: Tensor,
@@ -409,7 +409,7 @@ pub struct GraphCapturer<M: CudaGraphModule> {
     #[cfg(feature = "flashinfer")]
     pub flashinfer_kv_params: Option<FlashInferKvParams>,
     pub is_mla: bool,
-    pub mtp_graph_vars: Option<MtpGraphCaptureVars>,
+    pub spec_graph_vars: Option<SpecGraphCaptureVars>,
 }
 
 pub fn planned_graph_capture_batches(max_num_seqs: usize) -> Vec<usize> {
@@ -485,7 +485,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             #[cfg(feature = "flashinfer")]
             flashinfer_kv_params: flashinfer_kv_params.clone(),
             is_mla,
-            mtp_graph_vars: None,
+            spec_graph_vars: None,
         }
     }
 
@@ -714,6 +714,9 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         positions: &Tensor,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
+        let _fp8_domain = attention_rs::fp8_linear::set_fp8_execution_domain(
+            attention_rs::fp8_linear::Fp8ExecutionDomain::DecodeGraph,
+        );
         if input_metadata.is_prefill {
             candle_core::bail!("Graph replay is not used for prefill!")
         }
@@ -830,13 +833,14 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         }
     }
 
-    pub fn capture_mtp(
+    pub fn capture_draft_graph(
         &mut self,
         device: &Device,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
-        mtp_num_speculative: usize,
+        spec_num_tokens: usize,
+        name: &'static str,
     ) -> Result<()> {
-        if mtp_num_speculative == 0 {
+        if spec_num_tokens == 0 {
             return Ok(());
         }
 
@@ -845,7 +849,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         );
         let _prefill_guard = set_linear_is_prefill(true);
         self.device = Some(device.clone());
-        let verify_len = mtp_num_speculative + 1;
+        let verify_len = spec_num_tokens + 1;
         let max_num_blocks = (self.max_model_len + self.block_size - 1) / self.block_size;
 
         // Capture must use in-bounds, decode-consistent page metadata. Zeroed
@@ -961,6 +965,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         };
 
         let mut outputs = BTreeMap::<usize, Tensor>::new();
+        let mut stable_logits: Option<Tensor> = None;
         let _guard = candle_core::cuda_backend::cuda_param_cache_scope(true);
 
         for phase in CapturePhase::ALL {
@@ -970,13 +975,19 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 self.model.start_capture(verify_len)?;
             }
             if phase.is_warmup() {
-                let _ = self.model.forward(
+                let out = self.model.forward(
                     &input_ids,
                     &positions,
                     kv_caches,
                     &input_metadata,
                     false,
                 )?;
+                // Allocate the stable logits buffer on the default pool during
+                // uncaptured cache-prewarm so AUTO_FREE_ON_LAUNCH does not
+                // invalidate the address read after graph replay.
+                if phase.is_cache_prewarm() {
+                    stable_logits = Some(Tensor::zeros(out.shape(), out.dtype(), device)?);
+                }
                 #[cfg(feature = "cuda")]
                 if !should_capture {
                     device.synchronize()?;
@@ -989,7 +1000,15 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     &input_metadata,
                     false,
                 )?;
-                outputs.insert(verify_len, out);
+                let stable = stable_logits.as_ref().ok_or_else(|| {
+                    candle_core::Error::msg(format!(
+                        "{} graph capture missing stable logits buffer (cache prewarm failed)",
+                        name
+                    ))
+                })?;
+                // D2D into non-pool storage; this copy is part of the captured graph.
+                stable.copy_(&out, 0)?;
+                outputs.insert(verify_len, stable.clone());
             }
             if should_capture {
                 self.model.end_capture(!phase.is_warmup())?;
@@ -999,12 +1018,13 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         }
 
         crate::log_warn!(
-            "Captured MTP verify graph len={} (flashinfer={})",
+            "Captured {} verify graph len={} (flashinfer={})",
+            name,
             verify_len,
             use_flashinfer
         );
 
-        self.mtp_graph_vars = Some(MtpGraphCaptureVars {
+        self.spec_graph_vars = Some(SpecGraphCaptureVars {
             input_ids,
             positions,
             mamba_slot_mapping,
@@ -1028,83 +1048,87 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         Ok(())
     }
 
-    pub fn is_mtp_captured(&self, verify_len: usize) -> bool {
-        self.mtp_graph_vars
+    pub fn is_draft_graph_captured(&self, verify_len: usize) -> bool {
+        self.spec_graph_vars
             .as_ref()
             .map_or(false, |v| v.outputs.contains_key(&verify_len))
     }
 
-    pub fn replay_mtp(
+    pub fn replay_draft_graph(
         &self,
         input_ids: &Tensor,
         positions: &Tensor,
         input_metadata: &InputMetadata,
+        name: &'static str,
     ) -> Result<Tensor> {
+        let _fp8_domain = attention_rs::fp8_linear::set_fp8_execution_domain(
+            attention_rs::fp8_linear::Fp8ExecutionDomain::MtpGraph,
+        );
         let verify_len = input_ids.dim(0)?;
         let max_num_blocks = (self.max_model_len + self.block_size - 1) / self.block_size;
 
-        let mtp_vars = self
-            .mtp_graph_vars
+        let spec_vars = self
+            .spec_graph_vars
             .as_ref()
-            .ok_or_else(|| candle_core::Error::msg("MTP graphs not captured"))?;
+            .ok_or_else(|| candle_core::Error::msg(format!("{} graphs not captured", name)))?;
 
-        if !mtp_vars.outputs.contains_key(&verify_len) {
-            candle_core::bail!("MTP verify graph for len {} is not captured!", verify_len);
+        if !spec_vars.outputs.contains_key(&verify_len) {
+            candle_core::bail!("{} verify graph for len {} is not captured!", name, verify_len);
         }
 
-        mtp_vars.input_ids.zero_()?;
-        mtp_vars.input_ids.copy_(input_ids, 0)?;
-        mtp_vars.positions.zero_()?;
-        mtp_vars.positions.copy_(positions, 0)?;
+        spec_vars.input_ids.zero_()?;
+        spec_vars.input_ids.copy_(input_ids, 0)?;
+        spec_vars.positions.zero_()?;
+        spec_vars.positions.copy_(positions, 0)?;
 
         if let Some(ms_mapping) = input_metadata.mamba_slot_mapping.as_ref() {
-            mtp_vars.mamba_slot_mapping.zero_()?;
-            mtp_vars.mamba_slot_mapping.copy_(ms_mapping, 0)?;
+            spec_vars.mamba_slot_mapping.zero_()?;
+            spec_vars.mamba_slot_mapping.copy_(ms_mapping, 0)?;
         }
 
-        mtp_vars.slot_mapping.zero_()?;
-        mtp_vars
+        spec_vars.slot_mapping.zero_()?;
+        spec_vars
             .slot_mapping
             .copy_(&input_metadata.slot_mapping, 0)?;
 
         if let Some(c_lens) = input_metadata.context_lens.as_ref() {
-            mtp_vars.context_lens.zero_()?;
-            mtp_vars.context_lens.copy_(c_lens, 0)?;
+            spec_vars.context_lens.zero_()?;
+            spec_vars.context_lens.copy_(c_lens, 0)?;
         }
 
         if let Some(b_tables) = input_metadata.block_tables.as_ref() {
             let padded_table = b_tables
                 .pad_with_zeros(1, 0, max_num_blocks - b_tables.dim(1)?)?
                 .contiguous()?;
-            mtp_vars.block_tables.zero_()?;
-            mtp_vars.block_tables.copy_(&padded_table, 0)?;
+            spec_vars.block_tables.zero_()?;
+            spec_vars.block_tables.copy_(&padded_table, 0)?;
         }
 
         if let Some(cu_q) = input_metadata.cu_seqlens_q.as_ref() {
-            mtp_vars.cu_seqlens_q.copy_(cu_q, 0)?;
+            spec_vars.cu_seqlens_q.copy_(cu_q, 0)?;
         }
         if let Some(cu_k) = input_metadata.cu_seqlens_k.as_ref() {
-            mtp_vars.cu_seqlens_k.copy_(cu_k, 0)?;
+            spec_vars.cu_seqlens_k.copy_(cu_k, 0)?;
         }
 
         #[cfg(feature = "flashinfer")]
         if let Some(fm) = input_metadata.flashinfer_metadata.as_ref() {
-            mtp_vars.flashinfer_indptr.zero_()?;
-            mtp_vars.flashinfer_indptr.copy_(&fm.indptr, 0)?;
-            mtp_vars.flashinfer_indices.zero_()?;
-            mtp_vars.flashinfer_indices.copy_(&fm.indices, 0)?;
-            mtp_vars.flashinfer_last_len.zero_()?;
-            mtp_vars.flashinfer_last_len.copy_(&fm.last_len, 0)?;
+            spec_vars.flashinfer_indptr.zero_()?;
+            spec_vars.flashinfer_indptr.copy_(&fm.indptr, 0)?;
+            spec_vars.flashinfer_indices.zero_()?;
+            spec_vars.flashinfer_indices.copy_(&fm.indices, 0)?;
+            spec_vars.flashinfer_last_len.zero_()?;
+            spec_vars.flashinfer_last_len.copy_(&fm.last_len, 0)?;
             let batch_indices = fm.batch_indices.as_ref().ok_or_else(|| {
                 candle_core::Error::msg("mtp replay requires flashinfer batch_indices")
             })?;
             let positions = fm.positions.as_ref().ok_or_else(|| {
                 candle_core::Error::msg("mtp replay requires flashinfer positions")
             })?;
-            mtp_vars.flashinfer_batch_indices.zero_()?;
-            mtp_vars.flashinfer_batch_indices.copy_(batch_indices, 0)?;
-            mtp_vars.flashinfer_positions.zero_()?;
-            mtp_vars.flashinfer_positions.copy_(positions, 0)?;
+            spec_vars.flashinfer_batch_indices.zero_()?;
+            spec_vars.flashinfer_batch_indices.copy_(batch_indices, 0)?;
+            spec_vars.flashinfer_positions.zero_()?;
+            spec_vars.flashinfer_positions.copy_(positions, 0)?;
 
             if let Some(params) = self.flashinfer_kv_params {
                 let dev = self
@@ -1135,7 +1159,82 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
 
         self.model.replay(verify_len)?;
 
-        mtp_vars.outputs[&verify_len].contiguous()
+        spec_vars.outputs[&verify_len].contiguous()
+    }
+}
+
+/// CUDA graph for the DFlash draft transformer (opt-in, `XINFER_DFLASH_DRAFT_GRAPH`).
+/// Captures the draft forward `(target_hidden, noise_embedding, positions) -> draft_hidden` at
+/// the full context cap. Inputs are preallocated default-pool buffers; the output is D2D-copied
+/// into a stable default-pool buffer (the `AUTO_FREE_ON_LAUNCH` contract), so replay reads a
+/// stable address. The lm_head + argmax run eagerly on the replayed output.
+pub struct DFlashDraftGraph {
+    graph: Option<Arc<CudaGraph>>,
+    target_hidden: Tensor,
+    noise_embedding: Tensor,
+    positions: Tensor,
+    out: Tensor,
+    device: Device,
+}
+
+impl DFlashDraftGraph {
+    pub fn new(cap: usize, block: usize, hidden: usize, dtype: DType, device: &Device) -> Result<Self> {
+        Ok(Self {
+            graph: None,
+            target_hidden: Tensor::zeros((cap, hidden), dtype, device)?,
+            noise_embedding: Tensor::zeros((block, hidden), dtype, device)?,
+            positions: Tensor::zeros((cap + block,), DType::I64, device)?,
+            out: Tensor::zeros((cap + block, hidden), dtype, device)?,
+            device: device.clone(),
+        })
+    }
+
+    /// Capture the draft forward (`draft_fwd` runs the draft transformer) into a CUDA graph.
+    pub fn capture<F: FnOnce(&Tensor, &Tensor, &Tensor) -> Result<Tensor>>(
+        &mut self,
+        draft_fwd: F,
+    ) -> Result<()> {
+        let stream = self.device.as_cuda_device()?.cu_stream().clone();
+        CudaGraph::begin_capture(
+            stream,
+            CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        )?;
+        let out = draft_fwd(&self.target_hidden, &self.noise_embedding, &self.positions)?;
+        self.out.copy_(&out, 0)?;
+        let graph = CudaGraph::end_capture(
+            stream,
+            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u32 as u64,
+        )?;
+        self.graph = Some(Arc::new(graph));
+        Ok(())
+    }
+
+    /// Replay the captured draft forward with the real inputs; returns the draft hidden
+    /// (`[cap + block, hidden]`; the caller narrows the trailing `block` rows for the lm_head).
+    pub fn replay(
+        &self,
+        target_hidden: &Tensor,
+        noise_embedding: &Tensor,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let graph = self
+            .graph
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("DFlash draft graph not captured".into()))?;
+        self.target_hidden.copy_(target_hidden, 0)?;
+        self.noise_embedding.copy_(noise_embedding, 0)?;
+        self.positions.copy_(positions, 0)?;
+        graph.launch()?;
+        Ok(self.out.clone())
+    }
+
+    pub fn is_captured(&self) -> bool {
+        self.graph.is_some()
+    }
+
+    /// The context cap the graph was captured for (the draft context window size).
+    pub fn cap(&self) -> usize {
+        self.target_hidden.dim(0).unwrap_or(0)
     }
 }
 

@@ -8,9 +8,41 @@ use std::sync::{LazyLock, Mutex};
 
 use candle_core::{Result, Tensor};
 
-use crate::core::mtp::{verify_draft_masked, MtpSeqInfo, MtpVerifyResult};
+use crate::core::mtp::{verify_draft_masked, SpecSeqInfo, SpecVerifyResult};
 use crate::core::runner::{Model, ModelRunner, Seqs};
 use crate::models::layers::linear::set_linear_is_prefill;
+
+/// Effective speculative draft count for a step, scaled down as the KV context grows.
+///
+/// The verify forward costs O(ctx * K) target attention, so a large K is net-negative at long
+/// context (and acceptance tends to fall). Returns `base_k` when `context_len <= ref_ctx`, else
+/// `base_k * ref_ctx / context_len` (keeps the per-step verify cost roughly constant), floored at 1.
+/// No-op (returns `base_k`) when adaptive K is disabled via `XINFER_SPEC_ADAPTIVE_K=0`.
+pub(crate) fn adaptive_speculative_tokens(context_len: usize, base_k: usize) -> usize {
+    if base_k <= 1 || !crate::utils::env::spec_adaptive_k() {
+        return base_k;
+    }
+    let ref_ctx = crate::utils::env::spec_adaptive_ref_ctx().max(1);
+    // context-based: keep the per-step verify cost (O(ctx*K)) roughly constant.
+    let ctx_scaled = if context_len <= ref_ctx {
+        base_k
+    } else {
+        ((base_k as u128 * ref_ctx as u128) / context_len.max(1) as u128).clamp(1, base_k as u128)
+            as usize
+    };
+    // acceptance-based: scale K by the rolling acceptance rate (a low rate means the marginal
+    // draft tokens are unlikely to be accepted, so drafting them is not worth the verify cost).
+    let acc_scaled = ((base_k as f32) * spec_acceptance_rate()) as usize;
+    ctx_scaled.min(acc_scaled.max(1))
+}
+
+/// Global rolling acceptance rate (EMA of accepted/proposed, fixed-point x1000), for
+/// acceptance-based adaptive K. Updated in `spec_stats_update`; starts optimistic (1.0).
+static SPEC_ACCEPTANCE_EMA: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
+pub fn spec_acceptance_rate() -> f32 {
+    SPEC_ACCEPTANCE_EMA.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+}
 
 /// A speculative-drafting proposal: the anchor token plus the candidate block to verify.
 pub struct Proposal {
@@ -29,13 +61,13 @@ pub trait Drafter {
 
     /// Mechanism-specific anchor step: target forward + sample the anchor (FSM-committed).
     /// Returns `(anchor_token, optional hidden context for draft)`.
-    fn anchor(&self, runner: &ModelRunner, seqs: Seqs, seq: &MtpSeqInfo) -> Result<(u32, Option<Tensor>)>;
+    fn anchor(&self, runner: &ModelRunner, seqs: Seqs, seq: &SpecSeqInfo) -> Result<(u32, Option<Tensor>)>;
 
     /// Speculative drafts for the positions after the anchor.
     fn draft(
         &self,
         runner: &ModelRunner,
-        seq: &MtpSeqInfo,
+        seq: &SpecSeqInfo,
         anchor: u32,
         hidden: &Option<Tensor>,
     ) -> Result<Vec<u32>>;
@@ -49,7 +81,7 @@ pub trait Drafter {
     fn on_verified(
         &self,
         _runner: &ModelRunner,
-        _seq: &MtpSeqInfo,
+        _seq: &SpecSeqInfo,
         _proposal: &Proposal,
         _vhidden: &[Tensor],
         _accepted: usize,
@@ -95,7 +127,7 @@ struct SpecCounters {
 }
 
 impl SpecCounters {
-    fn add(&mut self, res: &MtpVerifyResult) {
+    fn add(&mut self, res: &SpecVerifyResult) {
         self.steps += 1;
         self.proposed += res.num_proposed;
         self.accepted += res.num_accepted;
@@ -142,13 +174,21 @@ static SPEC_SEQ_STATS: LazyLock<Mutex<HashMap<usize, SpecCounters>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Record one speculative step into the per-seq window.
-pub fn spec_stats_update(name: &str, seq_id: usize, res: &MtpVerifyResult) {
+pub fn spec_stats_update(name: &str, seq_id: usize, res: &SpecVerifyResult) {
     let mut map = SPEC_SEQ_STATS.lock().expect("spec seq stats mutex poisoned");
     let c = map.entry(seq_id).or_default();
     if c.mechanism.is_empty() {
         c.mechanism = name.to_string();
     }
     c.add(res);
+    // Update the global rolling acceptance EMA (for acceptance-based adaptive K): 0.9*old + 0.1*step.
+    let step_rate = if res.num_proposed > 0 {
+        res.num_accepted as u32 * 1000 / res.num_proposed as u32
+    } else {
+        0
+    };
+    let old = SPEC_ACCEPTANCE_EMA.load(std::sync::atomic::Ordering::Relaxed);
+    SPEC_ACCEPTANCE_EMA.store((old * 9 + step_rate) / 10, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Report + drop the per-sequence window (at the sequence's end). None if empty.
@@ -176,12 +216,12 @@ pub fn spec_seq_stats_data(seq_id: usize) -> crate::runner::SpecSeqStatsData {
     }).unwrap_or_default()
 }
 
-fn build_seq_infos(seqs: &Seqs) -> (usize, Vec<MtpSeqInfo>) {
+fn build_seq_infos(seqs: &Seqs) -> (usize, Vec<SpecSeqInfo>) {
     match seqs {
         Seqs::SeqRefs(s) => {
-            let infos: Vec<MtpSeqInfo> = s
+            let infos: Vec<SpecSeqInfo> = s
                 .iter()
-                .map(|seq| MtpSeqInfo {
+                .map(|seq| SpecSeqInfo {
                     id: seq.id,
                     len: seq.len(),
                     block_table: seq.block_table.clone(),
@@ -190,9 +230,9 @@ fn build_seq_infos(seqs: &Seqs) -> (usize, Vec<MtpSeqInfo>) {
             (s.len(), infos)
         }
         Seqs::DecodeVec(d) => {
-            let infos: Vec<MtpSeqInfo> = d
+            let infos: Vec<SpecSeqInfo> = d
                 .iter()
-                .map(|ds| MtpSeqInfo {
+                .map(|ds| SpecSeqInfo {
                     id: ds.id,
                     len: ds.len,
                     block_table: ds.block_tables.clone(),
@@ -271,19 +311,27 @@ impl ModelRunner {
         drop(kv_cache);
         drop(_prefill_guard);
 
-        // 7. Accept (grammar firewall) + mechanism post-verify hook.
-        let res = verify_draft_masked(
-            &vlogits,
-            &proposal.tokens,
-            &self.guided_decoding,
-            seq_id,
-        )?;
+        // 7. Accept: topk>1 tree (best path), grammar firewall (guided), rejection sampling
+        //    (unguided + non-greedy), or greedy argmax (unguided + greedy).
+        let default_sampling = crate::utils::logits_processor::Sampling::ArgMax;
+        let cached = self.cached_sampling.read();
+        let sampling = cached.as_ref().map(|c| &c.sampling).unwrap_or(&default_sampling);
+        let res = if self.guided_decoding.is_guided(seq_id) {
+            verify_draft_masked(&vlogits, &proposal.tokens, &self.guided_decoding, seq_id)?
+        } else if matches!(
+            sampling,
+            crate::utils::logits_processor::Sampling::ArgMax
+        ) {
+            crate::core::mtp::verify_draft_greedy(&vlogits, &proposal.tokens)?
+        } else {
+            crate::core::mtp::verify_draft_rejection(&vlogits, &proposal.tokens, sampling)?
+        };
         drafter.on_verified(self, seq_info, &proposal, &vhidden, res.num_accepted)?;
 
         // 8. Roll back hybrid (Mamba/GDN) state to the accepted boundary on partial rejection.
         if res.num_accepted < res.num_proposed {
             let keep_tokens = 1 + res.num_accepted;
-            self.mtp_rollback_mamba(seq_id, keep_tokens)?;
+            self.spec_rollback_mamba(seq_id, keep_tokens)?;
         }
 
         // 9. Emit [anchor, accepted..., continuation].
