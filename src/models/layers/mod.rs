@@ -10,6 +10,7 @@ pub mod mla_attention;
 pub mod mlp;
 pub mod moe;
 pub mod moe_w2_delta;
+pub mod nvfp4_kvcache;
 pub mod others;
 pub mod qwen4;
 pub mod rotary_emb;
