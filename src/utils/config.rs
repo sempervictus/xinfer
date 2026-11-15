@@ -4,6 +4,10 @@ use crate::transfer::PdConfig;
 use llguidance::api::TopLevelGrammar;
 #[cfg(feature = "python")]
 use pyo3::pyclass;
+#[cfg(feature = "python")]
+use pyo3::pymethods;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
 use serde::de::value::SeqAccessDeserializer;
 use serde::de::{Deserializer, Visitor};
 use serde::ser::Error as _;
@@ -425,8 +429,8 @@ pub fn normalize_prefill_chunk_size(size: usize) -> usize {
 /// residency budgets. The `eviction_policy` is the LRU/FIFO selection. The
 /// `pinned` are the SLA-guaranteed tenants. The `allow_base_fallback`
 /// controls the unknown-adapter behavior (the 404 vs the base-model fallback).
-#[cfg_attr(feature = "python", pyclass)]
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[cfg_attr(feature = "python", pyclass)]
 pub struct LoraConfig {
     /// The (name, source) pairs (the `--lora NAME=SOURCE`, repeatable).
     pub adapters: Vec<(String, String)>,
@@ -451,6 +455,43 @@ pub struct LoraConfig {
     /// base model, the `false` returns a 404.
     #[serde(default)]
     pub allow_base_fallback: bool,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl LoraConfig {
+    /// Construct a LoraConfig from Python. The `adapters` are passed as
+    /// "NAME=SOURCE" strings (split on the first '='), the pyo3-friendly form of
+    /// the (name, source) pairs.
+    #[new]
+    #[pyo3(signature = (adapters=None, max_tenants=None, max_active=None, max_bytes=None, eviction_policy=None, pinned=None, allow_base_fallback=false))]
+    pub fn new(
+        adapters: Option<Vec<String>>,
+        max_tenants: Option<usize>,
+        max_active: Option<usize>,
+        max_bytes: Option<u64>,
+        eviction_policy: Option<String>,
+        pinned: Option<Vec<String>>,
+        allow_base_fallback: bool,
+    ) -> Self {
+        let adapters = adapters
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| match s.split_once('=') {
+                Some((name, source)) => (name.to_string(), source.to_string()),
+                None => (s, String::new()),
+            })
+            .collect();
+        Self {
+            adapters,
+            max_tenants,
+            max_active,
+            max_bytes,
+            eviction_policy,
+            pinned: pinned.unwrap_or_default(),
+            allow_base_fallback,
+        }
+    }
 }
 
 #[cfg(not(feature = "python"))]

@@ -505,8 +505,18 @@ impl Qwen3_5MtpHead {
         embed_weight: &Tensor,
         lm_head_fn: impl Fn(&Tensor) -> Result<Tensor>,
         positions_base: usize,
-    ) -> Result<(Vec<u32>, Tensor)> {
+        // The draft-side grammar mask (the `XINFER_SPEC_DRAFT_MASK` gate, the
+        // speculative/mask_stream.rs). A `&mut MaskStream` the model loop drives:
+        // each step pulls the next allow-row + ff run, masks the draft logits
+        // on-device (the `where_cond`, the DFlash idiom at dflash.rs:951), argmaxes,
+        // then advances the stream by the drafted token + the ff literals (so the
+        // next row is induced by the actual trajectory, the positionally-correct
+        // walk). When `None` (the gate off, the unguided seq), the prior unmasked
+        // behavior (full back-compat, the no per-step mask kernel).
+        mut mask: Option<&mut crate::speculative::mask_stream::MaskStream>,
+    ) -> Result<(Vec<u32>, Tensor, Vec<Tensor>)> {
         let mut gpu_draft_tokens: Vec<Tensor> = Vec::with_capacity(num_tokens);
+        let mut draft_logits: Vec<Tensor> = Vec::with_capacity(num_tokens);
         let mut current_hidden = if initial_hidden.dims().len() == 1 {
             initial_hidden.unsqueeze(0)?
         } else {
@@ -528,9 +538,65 @@ impl Qwen3_5MtpHead {
             } else {
                 logits
             };
-            let next_token_t = logits_last.to_dtype(DType::F32)?.argmax(D::Minus1)?;
+            // Keep the drafter's per-position distribution
+            // (the softmax input, the F32 logits) -- the `p_draft` for the
+            // rejection-sampling verify.
+            let draft_logit = logits_last.to_dtype(DType::F32)?;
+
+            // The draft-side grammar mask (the `XINFER_SPEC_DRAFT_MASK` gate). When `Some`,
+            // drive the MaskStream: pull this step's device allow-row + ff run, mask
+            // the draft logits on-device (the `where_cond`, the DFlash idiom), argmax,
+            // then advance the stream by the drafted token + the ff literals (so the
+            // next row is induced by the actual trajectory, the positionally-correct
+            // walk). When `None` (the gate off), the prior unmasked behavior (full
+            // back-compat, the no per-step mask kernel).
+            // The draft-side grammar mask (the `XINFER_SPEC_DRAFT_MASK` gate). When `Some`,
+            // drive the MaskStream: pull this step's device allow-row, mask the draft
+            // logits on-device (the `where_cond`, the DFlash idiom), argmax, then
+            // advance the stream by the drafted token (the ff literals are committed
+            // internally, the no double-commit). When `None` (the gate off), the
+            // prior unmasked behavior (full back-compat, the no per-step mask kernel).
+            let draft_logit = if let Some(mask) = &mut mask {
+                let vocab = draft_logit.dim(0)?;
+                let row = mask.next_allow_row(vocab, &self.device)?;
+                let neg_inf = Tensor::full(
+                    f32::NEG_INFINITY,
+                    draft_logit.shape().clone(),
+                    draft_logit.device(),
+                )?
+                .to_dtype(draft_logit.dtype())?;
+                let masked = row.allow.where_cond(&draft_logit, &neg_inf)?;
+                // The degraded case: the shadow FSM died at this position (the
+                // compute_mask failure). Stop drafting here (the committed prefix is
+                // kept, this position + beyond are discarded, the next step rebuilds
+                // a fresh shadow from the committed state). The no the draft this
+                // position (the no the advance a dead shadow, the no the next
+                // iteration's crash).
+                if row.degraded {
+                    break;
+                }
+                masked
+            } else {
+                draft_logit
+            };
+
+            let next_token_t = draft_logit.argmax(D::Minus1)?;
+
+            // Advance the MaskStream by the drafted token (the positionally-correct
+            // walk: the next row is induced by what was actually committed). The ff
+            // literals are committed internally (the no double-commit of the forced
+            // token). No-op when the gate is off.
+            if let Some(mask) = &mut mask {
+                // The single drafted token (the cheap 1-element sync, the no full-tensor
+                // round-trip). The MaskStream is CPU-side (the Earley walk), so it needs
+                // the drafted token to advance; this is the per-step cost of the gated
+                // path (opt-in via XINFER_SPEC_DRAFT_MASK, the no overhead when off).
+                let drafted = next_token_t.to_scalar::<u32>()?;
+                mask.advance(drafted)?;
+            }
 
             gpu_draft_tokens.push(next_token_t.clone());
+            draft_logits.push(draft_logit);
             current_hidden = if hidden_out.dims().len() == 2 {
                 hidden_out.get(hidden_out.dim(0)? - 1)?.unsqueeze(0)?
             } else {
@@ -547,7 +613,7 @@ impl Qwen3_5MtpHead {
         };
 
         let final_hidden = current_hidden.squeeze(0)?;
-        Ok((draft_tokens, final_hidden))
+        Ok((draft_tokens, final_hidden, draft_logits))
     }
 
     /// Legacy draft method with CPU round-trips (kept for compatibility).

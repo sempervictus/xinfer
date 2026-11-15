@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use candle_core::{Device, DType, Error, Result, Tensor};
 use regex::Regex;
 use crate::speculative::resolve_draft_model;
-use crate::utils::config::{EngineConfig, LoraConfig, ModelType};
+use crate::utils::config::{EngineConfig, ModelType};
 use crate::utils::downloader::{Downloader, ModelPaths};
 
 /// Normalize a LoRA site path to its stable matching key: `layers.{i}.{leaf}`,

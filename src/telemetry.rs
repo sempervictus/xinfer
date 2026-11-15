@@ -180,6 +180,18 @@ pub struct Telemetry {
     spec_acceptance_rate: IntGaugeVec,
     spec_avg_tokens_per_step: IntGaugeVec,
 
+    // The spec-k live-feedback gauges (the read-on-scrape): the input to the
+    // K decision + the decision itself, so the operator can see how the dynamic is
+    // being driven. The accept_rate, the itl_ms, the spec_step_ms, the speedup,
+    // the k_chosen, the k_max.
+    spec_fb_accept_rate: IntGauge,
+    spec_fb_itl_ms: IntGauge,
+    spec_fb_spec_step_ms: IntGauge,
+    spec_fb_speedup: IntGauge,
+    spec_fb_k_current: IntGauge,
+    spec_fb_k_chosen: IntGauge,
+    spec_fb_k_max: IntGauge,
+
     // The runner queue-depth gauges (the read-on-scrape): the live/waiting/
     // cached/transferred sequence counts.
     seq_running: IntGauge,
@@ -433,6 +445,31 @@ impl Telemetry {
             &["drafter"],
         ).expect("metric construction");
 
+        // The spec-k live-feedback gauges (the read-on-scrape): the inputs to the
+        // K decision + the decision itself, so the operator can see how the
+        // dynamic K is being driven.
+        let spec_fb_accept_rate = IntGauge::new(
+            "xinfer_spec_fb_accept_rate", "The spec-k feedback: the measured acceptance rate (0-1000, the permille).",
+        ).expect("metric construction");
+        let spec_fb_itl_ms = IntGauge::new(
+            "xinfer_spec_fb_itl_ms", "The spec-k feedback: the plain decode ITL (ms, the itl_ema).",
+        ).expect("metric construction");
+        let spec_fb_spec_step_ms = IntGauge::new(
+            "xinfer_spec_fb_spec_step_ms", "The spec-k feedback: the spec step wall-time (ms, the spec_step_ema).",
+        ).expect("metric construction");
+        let spec_fb_speedup = IntGauge::new(
+            "xinfer_spec_fb_speedup", "The spec-k feedback: the speculative speedup (0-1000, the permille; the 1000 = break-even).",
+        ).expect("metric construction");
+        let spec_fb_k_current = IntGauge::new(
+            "xinfer_spec_fb_k_current", "The spec-k feedback: the K in effect for the last measured step.",
+        ).expect("metric construction");
+        let spec_fb_k_chosen = IntGauge::new(
+            "xinfer_spec_fb_k_chosen", "The spec-k feedback: the K the law chose for the next step.",
+        ).expect("metric construction");
+        let spec_fb_k_max = IntGauge::new(
+            "xinfer_spec_fb_k_max", "The spec-k feedback: the K ceiling (the spec_draft_max).",
+        ).expect("metric construction");
+
         // The runner queue-depth gauges (the read-on-scrape).
         let seq_running = IntGauge::new(
             "xinfer_seq_running", "The number of sequences in the running queue (the runtime).",
@@ -565,6 +602,13 @@ impl Telemetry {
         registry.register(Box::new(mamba_active_bytes.clone())).expect("metric registration");
         registry.register(Box::new(mamba_prefix_bytes.clone())).expect("metric registration");
         registry.register(Box::new(mamba_slot_bytes.clone())).expect("metric registration");
+        registry.register(Box::new(spec_fb_accept_rate.clone())).expect("metric registration");
+        registry.register(Box::new(spec_fb_itl_ms.clone())).expect("metric registration");
+        registry.register(Box::new(spec_fb_spec_step_ms.clone())).expect("metric registration");
+        registry.register(Box::new(spec_fb_speedup.clone())).expect("metric registration");
+        registry.register(Box::new(spec_fb_k_current.clone())).expect("metric registration");
+        registry.register(Box::new(spec_fb_k_chosen.clone())).expect("metric registration");
+        registry.register(Box::new(spec_fb_k_max.clone())).expect("metric registration");
 
         Self {
             registry,
@@ -634,6 +678,13 @@ impl Telemetry {
             mamba_active_bytes,
             mamba_prefix_bytes,
             mamba_slot_bytes,
+            spec_fb_accept_rate,
+            spec_fb_itl_ms,
+            spec_fb_spec_step_ms,
+            spec_fb_speedup,
+            spec_fb_k_current,
+            spec_fb_k_chosen,
+            spec_fb_k_max,
         }
     }
 
@@ -893,6 +944,20 @@ impl Telemetry {
                 .with_label_values(&["dflash"])
                 .set(dflash_stats_avg_tokens_per_step() as i64);
         }
+    }
+
+    /// Publish the spec-k live-feedback gauges (the read-on-scrape): the inputs
+    /// to the K decision (the accept rate, the ITL, the spec step time, the
+    /// speedup) + the decision itself (the K chosen, the K ceiling, the K
+    /// current). The operator can see exactly how the dynamic K is being driven.
+    pub fn publish_spec_feedback(&self, fb: &crate::core::qos::SpecFeedback) {
+        self.spec_fb_accept_rate.set((fb.accept_rate * 1000.0) as i64);
+        self.spec_fb_itl_ms.set(fb.itl_ms as i64);
+        self.spec_fb_spec_step_ms.set(fb.spec_step_ms as i64);
+        self.spec_fb_speedup.set((fb.speedup * 1000.0) as i64);
+        self.spec_fb_k_current.set(fb.k_current as i64);
+        self.spec_fb_k_chosen.set(fb.k_chosen as i64);
+        self.spec_fb_k_max.set(fb.k_max as i64);
     }
 
     /// Set the boot-time memory budget (the static, set at startup). The per-pool

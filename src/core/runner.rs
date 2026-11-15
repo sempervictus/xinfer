@@ -12,8 +12,11 @@ use crate::core::lora::{
     LoraRegistry, DEFAULT_LORA_MAX_BYTES,
 };
 use crate::core::mem_budget::{apply_kv_cache_cap, GpuReserve, PoolBudget};
-use crate::utils::env::moe_offload_auto;
+use crate::utils::env::{moe_offload_auto, spec_parallel_draft};
 use crate::models::layers::moe_offload::budget::grow_to_budget;
+use crate::speculative::{DFlashDrafter, uses_dflash, uses_builtin_mtp};
+use crate::speculative::dflash::init_dflash_drafter;
+use crate::speculative::spec_stats::spec_stats_update_ff;
 use crate::server::EmbeddingStrategy;
 use crate::transfer::Transfer;
 #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -225,7 +228,7 @@ pub struct ModelRunner {
     /// Number of speculative tokens to draft per step
     pub(crate) mtp_num_speculative: usize,
     /// Optional external DFlash2 drafter.
-    pub(crate) dflash_drafter: Option<crate::speculative::DFlashDrafter>,
+    pub(crate) dflash_drafter: Option<DFlashDrafter>,
     /// The per-instance LoRA registry (the multi-tenant adapter set, the Punica
     /// shared-base + per-tenant delta). Empty when no adapter is configured.
     /// The `Mutex` allows the on-demand load (the `ensure_tenant_loaded`, the
@@ -414,10 +417,26 @@ impl ModelRunner {
         self.cached_sampling.read().clone()
     }
 
+    /// The grammar-guided decoding state (the per-seq `GuidanceState` map). Exposed
+    /// so the speculative verify paths (the mtp.rs / the dflash.rs, the separate
+    /// `crate::speculative` module) can build the per-verify-row grammar masks
+    /// (the `project_verify_masks`) without reaching into the private field.
+    pub(crate) fn guided_decoding(&self) -> &GuidedDecoding {
+        &self.guided_decoding
+    }
+
     /// Whether this runner is the rank-0 shard (the authoritative NCCL all-reduce
     /// makes all ranks agree, so rank-0 logs are the single source of truth).
     pub(crate) fn is_first_rank(&self) -> bool {
         self.is_first_rank
+    }
+
+    /// The dynamic-K break-even threshold (the `QosConfig.spec_draft_break_even`, the
+    /// runner-side access to the private `config` field, the no the mtp.rs reaching
+    /// into `self.config`). The runner uses this to compute the per-seq next-K (the
+    /// rolling prefix-curve knee).
+    pub(crate) fn spec_break_even(&self) -> f64 {
+        self.config.qos.spec_draft_break_even as f64
     }
 
     #[cfg(feature = "flashinfer")]
@@ -520,8 +539,8 @@ impl ModelRunner {
     ) -> Result<Self> {
         attention_rs::reset_paged_attention_layer_counter();
         let requested_num_speculative = econfig.num_speculative_tokens.unwrap_or(0);
-        let uses_dflash = crate::speculative::uses_dflash(econfig);
-        let uses_builtin_mtp = crate::speculative::uses_builtin_mtp(econfig) && !uses_dflash;
+        let uses_dflash = uses_dflash(econfig);
+        let uses_builtin_mtp = uses_builtin_mtp(econfig) && !uses_dflash;
         let is_mtp_model_type = Self::is_mtp_model_type(&model_type);
         let has_mtp_config = config.mtp_num_hidden_layers.unwrap_or(0) > 0;
         let has_mtp_weights = Self::has_mtp_weights(vb, config);
@@ -536,10 +555,18 @@ impl ModelRunner {
             config.mtp_enabled = builtin_mtp_enabled;
         }
         // Size GDN MTP snapshot buffers for worst-case packed verify:
-        // max_num_seqs * (speculative_tokens + 1).
+        // spec_parallel_draft * (speculative_tokens + 1). The shared cap
+        // (env::spec_parallel_draft, the 0 = single-seq) is what the MTP + DFlash
+        // dispatch gates batch to (core/engine.rs), so the buffer always holds
+        // the verify batch (the no the GDN narrow OOB).
         if config.mtp_enabled {
             let spec_tokens = requested_num_speculative.max(1);
-            let max_seqs = econfig.max_num_parallel_reqs.max(1);
+            // Size the verify buffer to the admission capacity (the max concurrent
+            // sequences), capped by the draft cap when the env is set. No static
+            // fallback to max_num_seqs.
+            let admission_cap = econfig.max_num_parallel_reqs.max(1);
+            let draft_cap = spec_parallel_draft().unwrap_or(usize::MAX);
+            let max_seqs = admission_cap.min(draft_cap);
             config.mtp_max_verify_tokens = max_seqs.saturating_mul(spec_tokens.saturating_add(1));
         }
 
@@ -867,28 +894,28 @@ match allocator.plan(&device_ids, econfig) {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
                 if config.mtp_enabled {
-                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
+                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(1))?;
                 }
             }
             Model::Qwen3_5MoE(model) => {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
                 if config.mtp_enabled {
-                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
+                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(1))?;
                 }
             }
             Model::Qwen4(model) => {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
                 if config.mtp_enabled {
-                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
+                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(1))?;
                 }
             }
             Model::Qwen3VL(model) => {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
                 if config.mtp_enabled {
-                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
+                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(1))?;
                 }
             }
             _ => {}
@@ -1079,7 +1106,7 @@ match allocator.plan(&device_ids, econfig) {
             (None, 0)
         };
         let dflash_drafter =
-            crate::speculative::dflash::init_dflash_drafter(econfig, comm.clone(), &device)?;
+            init_dflash_drafter(econfig, comm.clone(), &device)?;
         // DFlash2 reuses the MTP verify CUDA-graph capturer. When only DFlash2 is
         // enabled, borrow num_speculative for capture/replay sizing.
         if mtp_num_speculative == 0 {
@@ -1088,21 +1115,32 @@ match allocator.plan(&device_ids, econfig) {
                 if econfig.num_speculative_tokens.is_none() {
                     econfig.num_speculative_tokens = Some(drafter.num_speculative_tokens);
                 }
-                let max_seqs = econfig.max_num_parallel_reqs.max(1);
+                let admission_cap = econfig.max_num_parallel_reqs.max(1);
+                let draft_cap = spec_parallel_draft().unwrap_or(usize::MAX);
+                let max_seqs = admission_cap.min(draft_cap);
                 config.mtp_max_verify_tokens =
                     max_seqs.saturating_mul(drafter.num_speculative_tokens.saturating_add(1));
             }
         }
         if let Some(drafter) = dflash_drafter.as_ref() {
+            // The DFlash verify batch is capped by spec_parallel_draft (the MTP/DFlash
+            // parity, core/engine.rs), so the buffer must hold that many seqs ×
+            // verify_len (the no the single-seq verify_len, which under-sized the
+            // 2-slot default batch and silently disables the verify via the
+            // qwen3_5.rs:564 guard).
+            let admission_cap = econfig.max_num_parallel_reqs.max(1);
+            let draft_cap = spec_parallel_draft().unwrap_or(usize::MAX);
+            let dflash_slots = admission_cap.min(draft_cap);
             let verify_len = drafter.num_speculative_tokens + 1;
+            let batch_verify_len = dflash_slots.saturating_mul(verify_len);
             let layer_ids = drafter.target_layer_ids();
             match &model {
-                Model::Qwen3_5(m) => m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?,
+                Model::Qwen3_5(m) => m.preallocate_dflash_verify_buffers(layer_ids, batch_verify_len)?,
                 Model::Qwen3_5MoE(m) => {
-                    m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?
+                    m.preallocate_dflash_verify_buffers(layer_ids, batch_verify_len)?
                 }
-                Model::Qwen4(m) => m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?,
-                Model::Qwen3VL(m) => m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?,
+                Model::Qwen4(m) => m.preallocate_dflash_verify_buffers(layer_ids, batch_verify_len)?,
+                Model::Qwen3VL(m) => m.preallocate_dflash_verify_buffers(layer_ids, batch_verify_len)?,
                 _ => {}
             }
         }
@@ -1308,6 +1346,34 @@ match allocator.plan(&device_ids, econfig) {
             Model::Qwen3VL(model) => Ok(model.remove_mamba_prefix_state(hash)),
             _ => Ok(true),
         }
+    }
+
+    /// Speculative fast-forward decode: sample the base token (the current `run`, which
+    /// commits it to the FSM), then append the full grammar-forced (ff) run that follows.
+    /// The ff tokens are deterministic (forced by the grammar), so they are committed
+    /// directly without model sampling. Returns `[base_token, ff_run...]` per sequence;
+    /// the next draft anchors on the last ff token.
+    pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
+        let base_tokens = self.run(seqs, false)?;
+        let seq_ids: Vec<usize> = match &seqs {
+            Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
+            Seqs::DecodeVec(v) => v.iter().map(|s| s.id()).collect(),
+        };
+        let mut outputs: Vec<Vec<u32>> = Vec::with_capacity(seq_ids.len());
+        for (i, seq_id) in seq_ids.iter().enumerate() {
+            let mut out = vec![base_tokens[i]];
+            // The remaining grammar run (from the FSM state after the base token is committed).
+            let remaining_ff = self.guided_decoding.ff_tokens(*seq_id);
+            if !remaining_ff.is_empty() {
+                self.guided_decoding.commit_ff_sequence(*seq_id);
+                // Report the ff continuation in the per-seq speculative stats (the same
+                // optional end-of-sequence report as MTP/DFlash).
+                spec_stats_update_ff("SpecFF", *seq_id, remaining_ff.len());
+                out.extend(remaining_ff);
+            }
+            outputs.push(out);
+        }
+        Ok(outputs)
     }
 
     #[allow(unused)]
@@ -2625,8 +2691,14 @@ match allocator.plan(&device_ids, econfig) {
                 } else {
                     "MTP"
                 };
+                // Capture a verify graph for EVERY draft length 1..=mtp_num_speculative
+                // (the verify_len = k + 1 for each k). The dynamic-K path (the
+                // per-seq spec_k in 0..=mtp_num_speculative) then always has a
+                // captured graph to replay (the no a non-graph forward fallback).
+                // Each length is its own capture session (the start_capture/forward/
+                // end_capture), stored in the outputs BTreeMap keyed by verify_len.
                 crate::log_info!(
-                    "Capturing {} verify graphs for up to {} draft tokens...",
+                    "Capturing {} verify graphs for K = 1..={}",
                     label,
                     self.mtp_num_speculative
                 );
@@ -2870,6 +2942,7 @@ mod tests {
             block_table_last: 0,
             block_tables: vec![0],
             sampling_params,
+            spec_k: 0,
         }
     }
 

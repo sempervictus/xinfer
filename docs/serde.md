@@ -67,7 +67,7 @@ so the framing stays aligned without a separate.
 - `bincode` is unmaintained (the last release predates the current Rust edition
   + has known soundness concerns in its derive). `rmp-serde` is actively
   maintained, is the de-facto standard MessagePack for Rust, + is what the
-  upstream `llguidance` / `pushdown-rs` / `attention-rs` deps already use, so it
+  upstream `llguidance` / `attention-rs` deps already use, so it
   avoids a second serialization stack in the dep graph.
 
 ### Citations / references

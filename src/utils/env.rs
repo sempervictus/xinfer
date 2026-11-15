@@ -138,6 +138,159 @@ pub fn stream_reservoir() -> bool {
     })
 }
 
+/// Cap on the DFlash projected-hidden context window kept per sequence (in rows).
+/// `0` means unbounded full history; set e.g. `XINFER_SPEC_CONTEXT_WINDOW=512` to
+/// bound memory on very long generations.
+pub const SPEC_CONTEXT_WINDOW_ENV: &str = "XINFER_SPEC_CONTEXT_WINDOW";
+static SPEC_CONTEXT_WINDOW: OnceLock<usize> = OnceLock::new();
+
+pub fn spec_context_window() -> usize {
+    *SPEC_CONTEXT_WINDOW.get_or_init(|| {
+        env::var(SPEC_CONTEXT_WINDOW_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4096) // Default: 4096 (matches DFlash2 training window)
+    })
+}
+
+/// Opt-out: capture the DFlash draft transformer into a CUDA graph (replayed when
+/// the context window is full). Default ON; set `XINFER_SPEC_GRAPH=0` to force the
+/// eager draft.
+pub const SPEC_GRAPH_ENV: &str = "XINFER_SPEC_GRAPH";
+static SPEC_GRAPH: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_graph() -> bool {
+    *SPEC_GRAPH.get_or_init(|| {
+        !matches!(
+            env::var(SPEC_GRAPH_ENV)
+                .ok()
+                .as_deref()
+                .map(|v| v.trim().eq_ignore_ascii_case("0") || v.trim().eq_ignore_ascii_case("false")),
+            Some(true)
+        )
+    })
+}
+
+/// Optional override for how many concurrent sequences may draft in parallel
+/// (the shared MTP + DFlash parity). When `None` (the default, the env unset),
+/// the cap is the admission capacity (`max_num_seqs`) — so if admission is
+/// uncapped + parallel drafts are enabled, drafting is uncapped too. When set
+/// to `N`, drafting is capped at `N` sequences (the verify batch is `N x (K+1)`
+/// tokens, and the MTP + DFlash verify buffers are sized to match, runner.rs).
+///
+/// Back-compat: `XINFER_SPEC_PARALLEL_DRAFT=1`/`true`/`yes` parses as `Some(1)`
+/// (single-seq); a numeric value (e.g. `2`) is `Some(2)`. This replaces the old
+/// bool `spec_parallel_draft` + the separate `dflash_parallel_slots` (now a
+/// deprecated alias).
+pub const SPEC_PARALLEL_DRAFT_ENV: &str = "XINFER_SPEC_PARALLEL_DRAFT";
+static SPEC_PARALLEL_DRAFT: OnceLock<Option<usize>> = OnceLock::new();
+
+pub fn spec_parallel_draft() -> Option<usize> {
+    *SPEC_PARALLEL_DRAFT.get_or_init(|| {
+        env::var(SPEC_PARALLEL_DRAFT_ENV)
+            .ok()
+            .map(|v| {
+                let t = v.trim().to_lowercase();
+                match t.as_str() {
+                    "1" | "true" | "yes" => Some(1), // the legacy bool form = single-seq
+                    _ => t.parse::<usize>().ok(),
+                }
+            })
+            .flatten()
+    })
+}
+
+/// Speculative fast-forward decode: after the sampled base token, append the full
+/// grammar-forced (ff) run instead of sampling it one token at a time. Set
+/// `XINFER_SPEC_FF=1` to enable (default off).
+pub const SPEC_FF_ENV: &str = "XINFER_SPEC_FF";
+static SPEC_FF: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_ff() -> bool {
+    *SPEC_FF.get_or_init(|| {
+        env::var(SPEC_FF_ENV)
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// The ff-span KV reserve (the positions past the base that the ff fast-forward
+/// pre-allocates). The default is 32 (the typical tool-call header, the 10-20
+/// forced tokens, with headroom). A user grammar with a longer forced literal
+/// prefix (the >32 ff run) can raise this via the env (the no the static cap
+/// truncating the ff span). The 0 disables the ff pre-alloc (the ff forward
+/// falls back to the on-demand block allocation, the no the reserved span).
+pub const FF_RESERVE_ENV: &str = "XINFER_FF_RESERVE";
+static FF_RESERVE: OnceLock<Option<usize>> = OnceLock::new();
+
+pub fn ff_reserve() -> Option<usize> {
+    *FF_RESERVE.get_or_init(|| {
+        env::var(FF_RESERVE_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    })
+}
+
+/// `XINFER_SPEC_REJECTION_SAMPLING=1` enables lossless rejection-sampling verify
+/// for speculative decode (the Leviathan algorithm: accept a draft token with
+/// probability `min(1, p_target/p_draft)`, on rejection sample the residual
+/// `max(0, p_target - p_draft)`). Default OFF: the greedy verify (the argmax
+/// accept, the no distribution correction) is used. When ON + the target sampling
+/// is non-greedy (temperature > 0), the verify honors the target's sampled
+/// distribution (the no biased output). The drafter's per-position logits (the
+/// `p_draft`) are required -- the MTP head's `draft_tokens_gpu` returns them.
+pub const SPEC_REJECTION_SAMPLING_ENV: &str = "XINFER_SPEC_REJECTION_SAMPLING";
+static SPEC_REJECTION_SAMPLING: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_rejection_sampling() -> bool {
+    *SPEC_REJECTION_SAMPLING.get_or_init(|| {
+        env::var(SPEC_REJECTION_SAMPLING_ENV)
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// `XINFER_SPEC_DRAFT_MASK=1` enables the draft-side grammar MaskStream: the
+/// drafter's per-position proposals are masked by the grammar (the `p_draft`
+/// shares support with the masked `p_target`, the high-acceptance lossless
+/// verify) + the infallible ff literals are extracted for free (no draft
+/// forward spent on them). Default OFF: the prior unmasked draft behavior (full
+/// back-compat, the production toggle for QA on the GPU servers). When ON, the
+/// MTP draft loop + the DFlash burst are driven by the MaskStream (the single
+/// cloned-FSM trajectory, the two consumers: the drafter + the verify).
+pub const SPEC_DRAFT_MASK_ENV: &str = "XINFER_SPEC_DRAFT_MASK";
+static SPEC_DRAFT_MASK: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_draft_mask() -> bool {
+    *SPEC_DRAFT_MASK.get_or_init(|| {
+        env::var(SPEC_DRAFT_MASK_ENV)
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// `XINFER_SPEC_DYNAMIC_K=1` enables the per-sequence, per-step adaptive draft
+/// length (the rolling prefix-acceptance-curve knee). Default OFF: the draft
+/// length is the fixed `--num-speculative-tokens` ceiling (the prior behavior,
+/// the no surprise for existing deployments). When ON, each sequence's K tracks
+/// its own drafter reliability (a weak drafter drops K, a strong one holds the
+/// ceiling), so the verify-prefill cost is no longer paid for draft positions the
+/// drafter can't fill.
+pub const SPEC_DYNAMIC_K_ENV: &str = "XINFER_SPEC_DYNAMIC_K";
+static SPEC_DYNAMIC_K: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_dynamic_k() -> bool {
+    *SPEC_DYNAMIC_K.get_or_init(|| {
+        env::var(SPEC_DYNAMIC_K_ENV)
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
 pub fn mamba_snapshot_block_stride_blocks(default: usize) -> usize {
     let default = default.max(1);
     let Ok(raw) = env::var(MAMBA_SNAPSHOT_BLOCK_STRIDE_ENV) else {
@@ -163,30 +316,6 @@ pub fn mamba_snapshot_block_stride_blocks(default: usize) -> usize {
             default
         }
     }
-}
-
-pub const DEFAULT_REASONING_MAX_TOKENS_ENV: &str = "XINFER_DEFAULT_REASONING_MAX_TOKENS";
-pub const DEFAULT_REASONING_MAX_TOKENS_VALUE: usize = 512;
-
-static DEFAULT_REASONING_MAX_TOKENS: OnceLock<usize> = OnceLock::new();
-
-pub fn default_reasoning_max_tokens() -> usize {
-    *DEFAULT_REASONING_MAX_TOKENS.get_or_init(|| {
-        env::var(DEFAULT_REASONING_MAX_TOKENS_ENV)
-            .map(|raw| {
-                raw.trim()
-                    .parse::<usize>()
-                    .map(|n| {
-                        if n == 0 {
-                            DEFAULT_REASONING_MAX_TOKENS_VALUE
-                        } else {
-                            n
-                        }
-                    })
-                    .unwrap_or(DEFAULT_REASONING_MAX_TOKENS_VALUE)
-            })
-            .unwrap_or(DEFAULT_REASONING_MAX_TOKENS_VALUE)
-    })
 }
 
 /// Environment variable to disable soft masking for gradient smoothing.

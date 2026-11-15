@@ -20,6 +20,8 @@
 
 use crate::core::qos_histogram::WorkloadHistogram;
 use crate::core::sequence::Sequence;
+use crate::speculative::DynamicSdLookup;
+use crate::speculative::spec_stats::spec_seq_prefix_curve;
 use crate::utils::env::qos_enabled;
 use serde::{Deserialize, Serialize};
 
@@ -139,22 +141,67 @@ pub struct QosConfig {
     /// The P-Q1 drift re-calibration interval (steps). After the initial
     /// calibration window, every this many steps the controller re-derives the
     /// `None` setpoints from the rolling sample buffer + blends them into the
-    /// effective values (the no a step change). The `0` disables the periodic
+    /// effective values (no step change). The `0` disables the periodic
     /// re-derivation (the drift detector only).
+    #[serde(default = "default_recalibration_interval")]
     pub recalibration_interval: usize,
     /// The P-Q1 drift factor: the ITL p95 must exceed the calibrated SLO by this
     /// fraction (e.g. `0.25` = 25%) for the drift detector to consider the regime
     /// shifted. The `1.0` means "any excess" (the most sensitive).
+    #[serde(default = "default_drift_factor")]
     pub drift_factor: f64,
     /// The P-Q1 drift step count: the number of consecutive steps the ITL p95
     /// must stay over the drifted SLO before a re-calibration is triggered. The
-    /// `1` means immediate (the no the consecutive-stability requirement).
+    /// `1` means immediate (no consecutive-stability requirement).
+    #[serde(default = "default_drift_steps")]
     pub drift_steps: usize,
     /// The P-Q1 blend gain: the fraction of the newly-derived setpoint mixed into
     /// the effective value on a re-calibration (e.g. `0.25` = a 25% step toward
-    /// the new value, the no a discontinuous jump). The `1.0` is a full
-    /// replacement.
+    /// the new value, no discontinuous jump). The `1.0` is a full replacement.
+    #[serde(default = "default_recal_blend")]
     pub recal_blend: f64,
+    /// The maximum speculative draft length K (the ceiling for the dynamic-K).
+    /// When 0, speculative decoding is disabled.
+    #[serde(default)]
+    pub spec_draft_max: usize,
+    /// The break-even acceptance rate (the 0..1 fraction). When the measured
+    /// acceptance rate drops below this, the dynamic-K reduces to 1 (the SD off,
+    /// avoiding wasted verify compute). Default 0.3 (the MagicDec break-even).
+    #[serde(default = "default_spec_draft_break_even")]
+    pub spec_draft_break_even: f32,
+    /// The verify-cost ratio (the per-position verify cost in decode-step
+    /// equivalents, the 0.0 = the model-independent floor, the break-even only).
+    /// When set (the measured verify/decode time ratio, or a config floor), it
+    /// raises the K threshold for expensive models (the optimal K is model-
+    /// dependent, not a constant). The `k_threshold` is
+    /// `max(spec_draft_break_even, spec_verify_cost_ratio)`.
+    #[serde(default)]
+    pub spec_verify_cost_ratio: f32,
+    /// The dynamic speculative-draft-length schedule (the vLLM
+    /// `num_speculative_tokens_per_batch_size` equivalent: the list of
+    /// `(range_start, range_end, num_speculative_tokens)` triples). The small
+    /// batch maps to the large K (the latency win); the large batch maps to the
+    /// small K (the throughput win, the MagicDec result). The `None` = the static
+    /// `spec_draft_max` (no dynamic lookup).
+    #[serde(default)]
+    pub num_speculative_tokens_per_batch_size: Option<Vec<(usize, usize, usize)>>,
+}
+
+fn default_recalibration_interval() -> usize {
+    256
+}
+fn default_drift_factor() -> f64 {
+    0.25
+}
+fn default_drift_steps() -> usize {
+    32
+}
+fn default_recal_blend() -> f64 {
+    0.25
+}
+
+fn default_spec_draft_break_even() -> f32 {
+    0.3
 }
 
 impl Default for QosConfig {
@@ -180,6 +227,10 @@ impl Default for QosConfig {
             drift_factor: 0.25,
             drift_steps: 32,
             recal_blend: 0.25,
+            spec_draft_max: 0,
+            spec_draft_break_even: default_spec_draft_break_even(),
+            spec_verify_cost_ratio: 0.0,
+            num_speculative_tokens_per_batch_size: None,
         }
     }
 }
@@ -470,6 +521,13 @@ pub struct StepPlan {
     pub thr_slot_capacity: usize,
     pub thr_in_use: usize,
     pub thr_kv_full: bool,
+    /// The dynamic speculative draft length K (the QoS-computed, the no fixed
+    /// `num_speculative_tokens`). 0 = SD off. Drives the MTP/DFlash draft length
+    /// + the `prepare_step_view` pre-alloc. The MagicDec result: the K scales
+    /// with the batch size (the separate-drafter) + shrinks under the ITL
+    /// pressure (the gain) + drops to 1 when the acceptance is below the break-
+    /// even (the no wasted verify compute).
+    pub spec_draft_len: usize,
 }
 
 /// The parallelism hint the `AdaptivePlan` emits (the Shift Parallelism result:
@@ -545,7 +603,7 @@ pub struct QosController {
     gain: f32,
     /// EMA of measured step duration (ms) - the ITL proxy.
     itl_ema: f64,
-    /// EMA of observed output length (tokens) - drives class inference.
+/// EMA of observed output length (tokens) - drives class inference.
     output_len_ema: f64,
     /// The bounded-memory workload histogram (the core, the per-class signal).
     pub histogram: WorkloadHistogram,
@@ -560,15 +618,76 @@ pub struct QosController {
     /// The P-Q1 periodic re-cal counter: the steps since the last re-derivation.
     /// When it reaches `recalibration_interval`, a re-derivation is triggered.
     recal_steps: usize,
+    /// EMA of the decode batch size (the contended-vs-uncontended signal, the
+    /// MagicDec result: the SD speedup grows with the batch size).
+    spec_batch_ema: f64,
+    /// EMA of the speculative acceptance rate (the 0..1 fraction, the break-even
+    /// signal: below the `spec_draft_break_even` the SD is off).
+    spec_accept_ema: f64,
+    /// EMA of the measured verify-cost ratio (the speculative step time / the
+    /// baseline decode step time). When > 1.0, a K-wide verify costs more than
+    /// K plain decodes (speculation is not paying for itself). Feeds the
+    /// `k_threshold` so the knee collapses K when verify is expensive. The 0.0
+    /// until measured (no blind constant).
+    verify_cost_ema: f64,
+    /// EMA of the measured speculative step wall-time (ms). The raw cost of one
+    /// spec step (the draft + the verify + the validation), as live. Feeds
+    /// the spec_speedup (the speculative tokens/sec vs. the plain tokens/sec),
+    /// which drives the live K feedback (the no the context-invariant ratio).
+    spec_step_ema: f64,
+    /// The K used in the last measured spec step (the feedback pairing with the
+    /// spec_step_ema + the spec_accept_ema). The 0 until a spec step is measured.
+    spec_k_current: usize,
+    /// The dynamic speculative-draft-length lookup (the dense
+    /// `batch_size -> K` table). The `None` = the static `spec_draft_max` (no
+    /// dynamic lookup, the linear formula fallback).
+    dynamic_sd_lookup: Option<DynamicSdLookup>,
+}
+
+/// The spec-k feedback signals (the exported for the /metrics, so the
+/// operator can see how the K decisions are being made). The struct holds
+/// every input to the spec_speedup + the resulting K, so the decision is
+/// fully observable.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpecFeedback {
+    /// The measured acceptance rate (the 0..1, the spec_accept_ema).
+    pub accept_rate: f64,
+    /// The current K (the spec_k_current, the feedback pairing).
+    pub k_current: usize,
+    /// The plain decode ITL (ms, the itl_ema).
+    pub itl_ms: f64,
+    /// The spec step wall-time (ms, the spec_step_ema).
+    pub spec_step_ms: f64,
+    /// The computed speedup (the accept × (K+1) × itl / spec_step). The 1.0
+    /// is the break-even.
+    pub speedup: f64,
+    /// The resulting K (the spec_draft_len output, the max_k × the speedup
+    /// clamped).
+    pub k_chosen: usize,
+    /// The K ceiling (the spec_draft_max).
+    pub k_max: usize,
 }
 
 impl QosController {
     pub fn new(cfg: QosConfig) -> Self {
         let calibration_window = cfg.calibration_steps.max(1);
-        // The sample buffer cap (the P-Q1 bounded memory): the rolling window
+// The sample buffer cap (the P-Q1 bounded memory): the rolling window
         // length, so the calibration `Vec`s stay O(window) + retain the live
         // distribution for the drift re-calibration.
         let sample_cap = calibration_window;
+        // Build the dynamic SD lookup from the config (the vLLM
+        // `build_dynamic_sd_schedule_lookup` port). The `None` when the schedule
+        // is not configured (the static `spec_draft_max`).
+        let dynamic_sd_lookup = cfg
+            .num_speculative_tokens_per_batch_size
+            .as_ref()
+            .and_then(|schedule| {
+                DynamicSdLookup::build(
+                    schedule,
+                    256, // The max batch size (the table bound, no larger).
+                    cfg.spec_draft_max.max(1),
+                )
+            });
         Self {
             cfg,
             gain: 0.0,
@@ -580,8 +699,14 @@ impl QosController {
                 sample_cap,
                 ..Default::default()
             },
-            drift_streak: 0,
+drift_streak: 0,
             recal_steps: 0,
+            spec_batch_ema: 0.0,
+            spec_accept_ema: 1.0, // optimistic default (the SD on until measured otherwise)
+            verify_cost_ema: 0.0, // no measurement yet (the verify is a blind constant)
+            spec_step_ema: 0.0, // no measurement yet
+            spec_k_current: 0, // no measurement yet
+            dynamic_sd_lookup,
         }
     }
 
@@ -906,10 +1031,235 @@ impl QosController {
         self.histogram.record_exposed_time(class, work_class, host_ns, device_wait_ns);
     }
 
+    /// Feed the decode batch size for this step (the MagicDec signal: the SD
+    /// speedup grows with the batch size for the separate-drafter, the MTP is
+    /// batch-invariant). Drives the `spec_draft_len` computation in `plan()`.
+    pub fn record_spec_batch_size(&mut self, batch_size: usize) {
+        if batch_size == 0 {
+            return;
+        }
+        self.spec_batch_ema = if self.spec_batch_ema == 0.0 {
+            batch_size as f64
+        } else {
+            0.9 * self.spec_batch_ema + 0.1 * batch_size as f64
+        };
+    }
+
+    /// Feed the measured speculative acceptance rate (the 0..1 fraction, the
+    /// accepted-draft-tokens / the proposed-draft-tokens). Below the break-even
+    /// the `plan()` drops the `spec_draft_len` to 1 (the SD off, the no wasted
+    /// verify compute).
+    pub fn record_spec_acceptance(&mut self, accept_frac: f64) {
+        if accept_frac <= 0.0 {
+            return;
+        }
+        self.spec_accept_ema = if self.spec_accept_ema == 0.0 {
+            accept_frac
+        } else {
+            0.9 * self.spec_accept_ema + 0.1 * accept_frac
+        };
+    }
+
+    /// Record the measured verify-cost ratio for a speculative step (the
+    /// speculative step wall-time / the baseline decode step wall-time). When the
+    /// ratio is > 1.0, a K-wide verify costs more than K plain decodes (the
+    /// speculation is not paying for itself on this model/hardware). The EMA feeds
+    /// the `k_threshold` (the `verify_cost_ratio`) so the knee shrinks K when the
+    /// verify is expensive. The 0.0 input no speculative has run yet.
+    pub fn record_spec_verify_cost(&mut self, ratio: f64) {
+        if ratio <= 0.0 {
+            return;
+        }
+        self.verify_cost_ema = if self.verify_cost_ema == 0.0 {
+            ratio
+        } else {
+            0.9 * self.verify_cost_ema + 0.1 * ratio
+        };
+    }
+
+    /// Record a speculative step's wall-time + measure the verify-cost ratio
+    /// against the baseline decode ITL. The ratio is `spec_step_ms / itl_ema`
+    /// (the how many baseline decode-steps one speculative step costs). When the
+    /// ratio is > 1.0, a speculative step costs more than a plain decode (
+    /// (speculation is not paying for itself on this model/hardware), and the
+    /// `verify_cost_ratio` raises the K knee threshold to shrink K. The `itl_ema`
+    /// is the baseline (the non-spec decode step time, the `record_step` sensor).
+    pub fn record_spec_step(&mut self, spec_step_ms: f64, k: usize) {
+        if spec_step_ms <= 0.0 || self.itl_ema <= 0.0 {
+            return;
+        }
+        let ratio = spec_step_ms / self.itl_ema;
+        self.record_spec_verify_cost(ratio);
+        // The raw spec-step wall-time EMA (the live cost signal, the no the
+        // context-invariant ratio). The k is the draft length used for this step
+        // (the feedback pairing for the spec_speedup).
+        self.spec_step_ema = if self.spec_step_ema == 0.0 {
+            spec_step_ms
+        } else {
+            0.9 * self.spec_step_ema + 0.1 * spec_step_ms
+        };
+        self.spec_k_current = k;
+    }
+
+    /// The dynamic speculative draft length K (the QoS-computed, the MagicDec
+    /// result). The logic:
+    /// - The ceiling is the `cfg.spec_draft_max` (the 0 = the SD off).
+    /// - The batch-size scaling: the separate-drafter (DFlash) K grows with the
+    ///   batch (the MagicDec: the larger batch → the larger K, the verify is
+    ///   amortized over more tokens). The MTP is batch-invariant (the NInfer
+    ///   table: the 68% acceptance at C=1..8), so the MTP K is held constant.
+    /// - The ITL-pressure shrink: when the `gain` is high (the ITL over the SLO),
+    ///   the K shrinks (the verify is costing too much, the no added latency).
+    /// - The break-even guard: when the `spec_accept_ema` is below the
+    ///   `spec_draft_break_even`, the K drops to 1 (the SD off, the no wasted
+    ///   verify compute).
+    pub fn spec_draft_len(&self, is_mtp: bool) -> usize {
+        let max_k = self.cfg.spec_draft_max;
+        if max_k == 0 {
+            return 0; // the SD off (the no speculative decoding configured)
+        }
+        // The live spec-speedup feedback (the no the context-invariant ratio).
+        // The speedup is the speculative tokens/sec over. the plain tokens/sec:
+        //   spec_tokens/sec = accept_rate × (K+1) / spec_step_ms
+        //   plain_tokens/sec = 1 / itl_ms
+        //   speedup = accept_rate × (K+1) × itl_ms / spec_step_ms
+        // When the speedup > 1, speculation is faster than plain decode (hold /
+        // grow K toward the ceiling); When the speedup < 1, speculation is
+        // slower (shrink K toward 0, the plain sampling is faster). The K is the
+        // max_k × the speedup, clamped to [0, max_k] — a proportional feedback
+        // on the measured throughput,, not a static cost ratio.
+        let spec_speedup = self.spec_speedup();
+        let k = (max_k as f64 * spec_speedup).clamp(0.0, max_k as f64) as usize;
+        if is_mtp {
+            // The MTP is batch-invariant (the NInfer result: the stable acceptance
+            // across the C=1..8). The K is the speedup-driven value (the no batch
+            // scaling, but the live-feedback).
+            k
+        } else {
+            // The DFlash separate-drafter: the K scales with the batch (the
+            // MagicDec result) + is capped by the live speedup (the contention).
+            let batch = self.spec_batch_ema.max(1.0) as usize;
+            let batch_k = if let Some(lookup) = &self.dynamic_sd_lookup {
+                lookup.draft_len(batch).clamp(0, max_k)
+            } else {
+                let scaled = (max_k * batch) / 8;
+                scaled.clamp(0, max_k)
+            };
+            batch_k.min(k)
+        }
+    }
+
+    /// The live speculative speedup (the speculative tokens/sec ÷ the plain
+    /// tokens/sec). Computed from the measured EMAs: the acceptance rate, the
+    /// current K, the plain decode ITL, the spec step wall-time. The 1.0 is the
+    /// break-even (speculation == plain). The 1.0, speculation is faster;
+    /// below 1.0, plain sampling is faster. The 1.0 default (the no measurement
+    /// yet) is neutral (the K holds at the max_k until data arrives).
+    fn spec_speedup(&self) -> f64 {
+        if self.spec_step_ema <= 0.0 || self.itl_ema <= 0.0 {
+            return 1.0; // the no measurement yet: the neutral (the no premature shrink)
+        }
+        let k = self.spec_k_current as f64;
+        (self.spec_accept_ema * (k + 1.0) * self.itl_ema) / self.spec_step_ema
+    }
+
+    /// The current K (the last measured draft the feedback pairing). The 0 until a
+    /// spec step is measured.
+    pub fn spec_k_current(&self) -> usize {
+        self.spec_k_current
+    }
+
+    /// Compute the full spec-k feedback snapshot (the all the inputs + the
+    /// outputs, the exported for the /metrics). The `k_chosen` is the
+    /// spec_draft_len for the current drafter kind.
+    pub fn spec_feedback(&self, is_mtp: bool) -> SpecFeedback {
+        let k_max = self.cfg.spec_draft_max;
+        let speedup = self.spec_speedup();
+        let k_chosen = self.spec_draft_len(is_mtp);
+        SpecFeedback {
+            accept_rate: self.spec_accept_ema,
+            k_current: self.spec_k_current,
+            itl_ms: self.itl_ema,
+            spec_step_ms: self.spec_step_ema,
+            speedup,
+            k_chosen,
+            k_max,
+        }
+    }
+
+    /// The per-sequence dynamic-K law (the MTP path, the no global-EMA bistable).
+    /// Reads the sequence's rolling prefix-acceptance curve (the last `SPEC_K_WINDOW`
+    /// verify steps, the fast per-seq signal) + returns the KNEE: the largest draft
+    /// position `k` whose per-position acceptance is still ≥ the threshold. The
+    /// threshold is `max(spec_draft_break_even, verify_cost_ratio)` (the no drafting a
+    /// position that costs more verify than it returns in accepted tokens).
+    ///
+    /// This is what makes K *dynamic*: a sequence in an easy region (the curve stays
+    /// high) gets K = the ceiling; a sequence that enters a hard region (the curve
+    /// collapses) gets K = the knee (the no wasted verify past the reliable position).
+    /// The per-seq isolation means one sequence's hard region does not shrink another's.
+    /// When the seq has no recent history (the empty curve, the no stats yet),
+    /// the ceiling is returned (the no premature shrink before data exists).
+    pub fn spec_draft_len_for_seq(&self, seq_id: usize, is_mtp: bool) -> usize {
+        let max_k = self.cfg.spec_draft_max;
+        if max_k == 0 {
+            return 0; // the SD off
+        }
+        if !is_mtp {
+            // The DFlash separate-drafter keeps the batch-scaling law (the per-seq
+            // curve is the MTP path; the DFlash K is the batch-driven, the no per-seq
+            // acceptance knee).
+            return self.spec_draft_len(false);
+        }
+        // The MTP per-seq knee: read the rolling prefix curve + find the largest k
+        // whose acceptance is ≥ the threshold.
+        let threshold = self.k_threshold();
+        let curve = spec_seq_prefix_curve(seq_id, max_k);
+        if curve.is_empty() {
+            return max_k; // the no history yet: the ceiling (the no premature shrink)
+        }
+        // The knee: the largest k (1-indexed) where curve[k-1] >= threshold. The curve
+        // is non-increasing, so the knee is a prefix of reliable positions.
+        let mut k = 0;
+        for (i, &acc) in curve.iter().enumerate() {
+            if acc >= threshold {
+                k = i + 1; // the position i+1 is still reliable
+            } else {
+                break; // the curve collapsed: the no further positions are worth drafting
+            }
+        }
+        k.max(1) // the floor: at least 1 draft token (the no K=0 while SD is enabled)
+    }
+
+    /// The K threshold: `max(spec_draft_break_even, verify_cost_ratio)`. The
+    /// break-even is the acceptance floor (the no drafting a position that accepts <
+    /// 30% of the time by default); the verify cost ratio is the model/hardware-
+    /// dependent floor (a bigger model's verify is costlier, so the optimal K is
+    /// lower). The `max` of the two is the binding threshold.
+    fn k_threshold(&self) -> f64 {
+        let break_even = self.cfg.spec_draft_break_even as f64;
+        let cost = self.verify_cost_ratio();
+        break_even.max(cost)
+    }
+
+    /// The verify-cost ratio (the per-position verify cost in decode-step
+    /// equivalents). The higher of the operator-configured floor
+    /// (`spec_verify_cost_ratio`) + the measured `verify_cost_ema` (the actual
+    /// verify/decode time ratio observed on this model/hardware). A value of 0.0
+    /// (the no measurement yet + the no config floor) means "use only the
+    /// break-even floor" (the prior behavior). When the measured verify is
+    /// expensive (the ratio > 1.0), this raises the K threshold so the knee
+    /// shrinks K (the no drafting positions that verify costs more than they
+    /// return).
+    pub fn verify_cost_ratio(&self) -> f64 {
+        (self.cfg.spec_verify_cost_ratio as f64).max(self.verify_cost_ema)
+    }
+
     /// The law: given the running set and a block snapshot, produce the per-step plan.
-    /// When inactive, returns the static degenerate plan.
-    pub fn plan(&self, running: &[Sequence], blocks: &BlockSnapshot) -> StepPlan {
-        // The inactive case returns the static degenerate plan.
+    /// When inactive, returns the static degenerate plan. The `is_mtp` flag
+    /// determines the dynamic-K behavior (the MTP is batch-invariant, the DFlash
+    /// scales with the batch).
+    pub fn plan(&self, running: &[Sequence], blocks: &BlockSnapshot, is_mtp: bool) -> StepPlan {
         if !self.active() {
             return StepPlan {
                 chunk_size: blocks.static_chunk,
@@ -917,6 +1267,8 @@ impl QosController {
                 thr_slot_capacity: 0,
                 thr_in_use: 0,
                 thr_kv_full: false,
+                // The QoS-off degenerate: the fixed draft length (the no dynamic-K).
+                spec_draft_len: self.cfg.spec_draft_max,
             };
         }
         // The calibrating case: while the controller is still gathering profiling
@@ -932,6 +1284,9 @@ impl QosController {
                 thr_slot_capacity: 0,
                 thr_in_use: 0,
                 thr_kv_full: false,
+                // During calibration the controller does not act, so the draft
+                // length is the static ceiling (the no dynamic-K suppression).
+                spec_draft_len: self.cfg.spec_draft_max,
             };
         }
 
@@ -971,6 +1326,9 @@ impl QosController {
             thr_slot_capacity,
             thr_in_use,
             thr_kv_full,
+            // The dynamic-K (the QoS-computed, the MagicDec result): the MTP is
+            // batch-invariant (the constant K), the DFlash scales with the batch.
+            spec_draft_len: self.spec_draft_len(is_mtp),
         }
     }
 
@@ -981,8 +1339,8 @@ impl QosController {
     /// The golden test: a contended + high-ITL regime emits the
     /// `UseSequenceParallelism` hint; an uncontended + low-batch regime emits
     /// the `IncreaseTp` hint.
-    pub fn adaptive_plan(&self, running: &[Sequence], blocks: &BlockSnapshot) -> AdaptivePlan {
-        let base = self.plan(running, blocks);
+    pub fn adaptive_plan(&self, running: &[Sequence], blocks: &BlockSnapshot, is_mtp: bool) -> AdaptivePlan {
+        let base = self.plan(running, blocks, is_mtp);
         if !self.active() {
             return AdaptivePlan::from(base);
         }
@@ -1079,6 +1437,22 @@ impl QosController {
             (Some(pressure_thresh), Some(threshold)) if kv_pressure > pressure_thresh => Some(threshold),
             _ => None,
         };
+
+        // The KV-pressure cap on the speculative draft length. The K pre-alloc
+        // (the scheduler's pre_allocate_mtp_blocks, the seq.len + k + 1) needs room
+        // in the KV pool. When the pool is nearly full (the low mem_headroom), a
+        // large K cannot be pre-allocated and the verify forward hits the missing-
+        // KV-block error. Cap the K proportionally to the headroom: a full pool
+        // (the headroom near 0) drops the K to 1 (the plain decode, the no the
+        // wasted verify), a half-full pool halves the K, an empty pool keeps the
+        // speedup-driven K. The cap is the min of the speedup-driven K + the
+        // headroom-scaled K, so it only ever reduces the K (the no an increase).
+        let mut base = base;
+        if base.spec_draft_len > 1 {
+            let headroom = blocks.mem_headroom(); // the 0..1 free fraction
+            let headroom_k = (self.cfg.spec_draft_max as f32 * headroom) as usize;
+            base.spec_draft_len = base.spec_draft_len.min(headroom_k.max(1));
+        }
 
         AdaptivePlan {
             base,
@@ -1212,19 +1586,30 @@ pub struct SchedSeqStats {
     /// stats (the without this field) deserializable.
     #[serde(default)]
     pub model_label: String,
+    /// The speculative-draft K used for this sequence's pre-alloc (the `spec_draft_len`, the
+    /// QoS-computed dynamic K when active, the static `spec_draft_max` when QoS is off). 0 = SD
+    /// not enabled. Surfaced in the report so the operator sees the K the controller chose (the
+    /// adaptive-K visibility, the no invisible per-step output).
+    #[serde(default)]
+    pub spec_k: usize,
 }
 
 impl SchedSeqStats {
     /// One-line body for the per-sequence report (the caller adds the `[Seq N]` prefix).
     /// Returns `None` when QoS was not active (nothing to report).
 pub fn report(&self) -> Option<String> {
-        if !self.qos_active {
+        // The report is shown when QoS was active OR when speculative decode was
+        // enabled (the spec_k > 0) — so the operator sees the K the controller
+        // chose even with QoS off (the static spec_draft_max path). The no
+        // silent omission of the spec stat.
+        if !self.qos_active && self.spec_k == 0 {
             return None;
         }
-        // The model (the LoRA tenant) field is conditional: shown only when a LoRA
-        // tenant served the sequence (the model_label is not "base" + not empty).
-        // The no showing model=base when LoRA is off (the conditional-field rule,
-        // like the drafting + QoS stats that only show when active).
+        // The conditional fields: spec_k is shown only when spec-decode is active
+        // (spec_k > 0); the model (the LoRA tenant) is shown only when a LoRA
+        // adapter served the sequence (label not "base" + not empty). The no
+        // showing spec_k=0 / model=base when those features are off (the
+        // conditional-field rule, like the drafting + QoS stats).
         let mut parts = vec![
             format!(
                 "QoS[{qos_class:?}] itl={itl:.0}/{slo}ms gain={g0:.2}->{g1:.2} prefill={p} shrunk={s} prio={prio} resv={resv} preempt={pre} swap={sw} out={out}",
@@ -1242,6 +1627,9 @@ pub fn report(&self) -> Option<String> {
                 out = self.output_len,
             )
         ];
+        if self.spec_k > 0 {
+            parts.push(format!(" spec_k={}", self.spec_k));
+        }
         if self.model_label != "base" && !self.model_label.is_empty() {
             parts.push(format!(" model={}", self.model_label));
         }
@@ -1326,7 +1714,7 @@ mod tests {
             chunk_floor: 256,
         };
         let running = vec![seq_with(Some(100), 50)];
-        let plan = ctl.plan(&running, &blocks);
+        let plan = ctl.plan(&running, &blocks, false);
         assert_eq!(plan.chunk_size, 8192); // full static chunk
         assert_eq!(plan.token_budget, 16384);
         assert_eq!(plan.thr_slot_capacity, 0);
@@ -1390,8 +1778,174 @@ mod tests {
         for s in running.iter_mut() {
             s.output_ids.push(42); // mark actively generating (the sensor counts output_len > 0)
         }
-        let plan = ctl.plan(&running, &blocks);
+        let plan = ctl.plan(&running, &blocks, false);
         assert!(plan.chunk_size <= 256, "chunk should be suppressed, got {}", plan.chunk_size);
+    }
+
+    #[test]
+    fn dynamic_k_mtp_is_batch_invariant() {
+        // The MTP draft length is held constant (the NInfer result: the stable
+        // acceptance across the C=1..8). The `spec_draft_max` is the ceiling.
+        let mut cfg = QosConfig::default();
+        cfg.enabled = true;
+        cfg.spec_draft_max = 4;
+        let mut ctl = QosController::new(cfg);
+        // The small batch (the uncontended).
+        ctl.record_spec_batch_size(1);
+        assert_eq!(ctl.spec_draft_len(true), 4, "the MTP K is the max (the no-invariant)");
+        // The large batch (the contended).
+        ctl.record_spec_batch_size(32);
+        assert_eq!(ctl.spec_draft_len(true), 4, "the MTP K is still the max (the no batch scaling)");
+    }
+
+    #[test]
+    fn dynamic_k_dflash_scales_with_batch() {
+        // The DFlash separate-drafter K scales with the batch (the MagicDec result).
+        // The `spec_batch_ema` is the smoothed batch size; feed a single value
+        // (the no blending) to test the scaling directly.
+        let mut cfg = QosConfig::default();
+        cfg.enabled = true;
+        cfg.spec_draft_max = 8;
+        let mut ctl = QosController::new(cfg.clone());
+        // The small batch (the 1): the K = 8 * 1 / 8 = 1.
+        ctl.record_spec_batch_size(1);
+        assert_eq!(ctl.spec_draft_len(false), 1, "the small batch → the small K");
+        // The reference batch (the 8): the K = 8 * 8 / 8 = 8.
+        let mut ctl2 = QosController::new(cfg.clone());
+        ctl2.record_spec_batch_size(8);
+        assert_eq!(ctl2.spec_draft_len(false), 8, "the reference batch → the full K");
+        // The large batch (the 32): the K = 8 * 32 / 8 = 32, clamped to the max 8.
+        let mut ctl3 = QosController::new(cfg.clone());
+        ctl3.record_spec_batch_size(32);
+        assert_eq!(ctl3.spec_draft_len(false), 8, "the large batch → the K clamped to the max");
+    }
+
+    #[test]
+    fn dynamic_k_drops_to_one_below_break_even() {
+        // The live spec-speedup law (the P-Q3 / the dfb7739 feedback): the K is
+        // the max_k × the spec_speedup, clamped. The spec_speedup is
+        // accept_ema × (k+1) × itl_ema / spec_step_ema. When speculation is a net
+        // loss (the speedup < 1), the K shrinks; when it pays (the speedup >= 1),
+        // the K holds at the ceiling.
+        let mut cfg = QosConfig::default();
+        cfg.enabled = true;
+        cfg.spec_draft_max = 4;
+        let mut ctl = QosController::new(cfg);
+        ctl.record_spec_batch_size(8);
+        // Establish the baseline decode ITL (the itl_ema, the plain tokens/sec).
+        for _ in 0..20 {
+            ctl.record_step(10.0, Regime::Uncontended, QosClass::Throughput);
+        }
+        // The low acceptance (the 0.1) + an expensive spec step (the 40ms, the 4×
+        // the 10ms baseline) → the speedup = 0.1 × (4+1) × 10 / 40 = 0.125 < 1,
+        // so the K collapses toward 0 (the SD is a net loss).
+        for _ in 0..20 {
+            ctl.record_spec_acceptance(0.1);
+        }
+        ctl.record_spec_step(40.0, 4);
+        assert!(
+            ctl.spec_draft_len(false) < 4,
+            "the net-loss speculation must shrink the K below the ceiling (got {})",
+            ctl.spec_draft_len(false)
+        );
+        // The high acceptance (the 0.9) + a cheap spec step (the 10ms, the 1× the
+        // baseline) → the speedup = 0.9 × (4+1) × 10 / 10 = 4.5 >= 1, so the K
+        // holds at the ceiling.
+        for _ in 0..20 {
+            ctl.record_spec_acceptance(0.9);
+        }
+        ctl.record_spec_step(10.0, 4);
+        assert_eq!(
+            ctl.spec_draft_len(false),
+            4,
+            "the profitable speculation holds the full K (the max)"
+        );
+    }
+
+    #[test]
+    fn dynamic_k_zero_max_disables_sd() {
+        // The `spec_draft_max = 0` → the SD off (the no speculative decoding).
+        let mut cfg = QosConfig::default();
+        cfg.enabled = true;
+        cfg.spec_draft_max = 0;
+        let mut ctl = QosController::new(cfg);
+        ctl.record_spec_batch_size(8);
+        assert_eq!(ctl.spec_draft_len(true), 0, "the max=0 → the SD=0 (the SD off)");
+        assert_eq!(ctl.spec_draft_len(false), 0, "the max=0 → the K=0 (the SD off)");
+    }
+
+    #[test]
+    fn verify_cost_ratio_measured_raises_knee() {
+        // The verify-cost sensor: when a speculative step costs more than the
+        // baseline decode step (the ratio > 1.0), the `verify_cost_ratio` rises
+        // above the break-even floor, so the K knee shrinks (the no drafting
+        // positions whose verify costs more than they return).
+        let mut cfg = QosConfig::default();
+        cfg.enabled = true;
+        cfg.spec_draft_max = 4;
+        cfg.spec_draft_break_even = 0.3;
+        cfg.spec_verify_cost_ratio = 0.0; // the no config floor (the measured value rules)
+        let mut ctl = QosController::new(cfg);
+        // The baseline ITL (the `record_step` sets the `itl_ema`).
+        ctl.record_step(10.0, Regime::Uncontended, QosClass::Throughput);
+        // A speculative step that costs 3× the baseline decode step (the verify is
+        // expensive). Feed enough to pull the EMA up.
+        for _ in 0..20 {
+            ctl.record_spec_step(30.0, 4); // the 30ms spec step / the 10ms baseline = 3.0 (K=4)
+        }
+        assert!(
+            ctl.verify_cost_ratio() > 1.0,
+            "the measured verify cost ( exceed the baseline, got {}",
+            ctl.verify_cost_ratio()
+        );
+        // The knee threshold is includes the measured cost (the max of the break-even
+        // 0.3 + the verify_cost_ratio > 1.0), so a curve that's reliable only up to
+        // position 1 (the acceptance collapses past it) yields K=1, not the ceiling.
+        assert!(ctl.verify_cost_ratio() >= ctl.cfg.spec_draft_break_even as f64);
+    }
+
+    #[test]
+    fn verify_cost_ratio_cheap_verify_stays_low() {
+        // When the speculative step costs ~ the same as a baseline decode step
+        // (the ratio ~ 1.0, the verify is cheap), the `verify_cost_ratio` stays low
+        // and the knee is governed by the break-even acceptance floor (the prior
+        // behavior).
+        let mut cfg = QosConfig::default();
+        cfg.enabled = true;
+        cfg.spec_draft_max = 4;
+        cfg.spec_draft_break_even = 0.3;
+        let mut ctl = QosController::new(cfg);
+        ctl.record_step(10.0, Regime::Uncontended, QosClass::Throughput);
+        for _ in 0..20 {
+            ctl.record_spec_step(10.0, 4); // the spec step ≈ the baseline step (the ratio ~ 1.0)
+        }
+        assert!(
+            ctl.verify_cost_ratio() <= 1.5,
+            "a cheap verify should not inflate the cost ratio, got {}",
+            ctl.verify_cost_ratio()
+        );
+    }
+
+    #[test]
+    fn dynamic_sd_lookup_drives_dflash_k() {
+        // The configured `num_speculative_tokens_per_batch_size` schedule drives
+        // the DFlash K via the dense lookup (the vLLM `build_dynamic_sd_schedule_lookup`
+        // port). The golden: the `[(1,16,3),(32,128,2)]` schedule maps batch 17-31
+        // to K=3 (the carry-forward), the batch 32+ to K=2.
+        let mut cfg = QosConfig::default();
+        cfg.enabled = true;
+        cfg.spec_draft_max = 8;
+        cfg.num_speculative_tokens_per_batch_size = Some(vec![(1, 16, 3), (32, 128, 2)]);
+        let mut ctl = QosController::new(cfg.clone());
+        // The small batch (the 8): the lookup maps to K=3 (the range 1-16).
+        ctl.record_spec_batch_size(8);
+        assert_eq!(ctl.spec_draft_len(false), 3, "the batch 8 → the K=3 (the range 1-16)");
+        // The large batch (the 64): the lookup maps to K=2 (the range 32-128).
+        let mut ctl2 = QosController::new(cfg);
+        ctl2.record_spec_batch_size(64);
+        assert_eq!(ctl2.spec_draft_len(false), 2, "the batch 64 → the K=2 (the range 32-128)");
+        // The MTP is batch-invariant (the no lookup, the max K).
+        assert_eq!(ctl.spec_draft_len(true), 8, "the MTP K is the max (the no batch scaling)");
     }
 
     #[test]
@@ -1428,7 +1982,7 @@ mod tests {
         assert!(report.contains("itl=48/50ms"), "report: {report}");
     }
 
-    /// The model label in the per-sequence report (the LoRA/base marking). The
+/// The model label in the per-sequence report (the LoRA/base marking). The
     /// inclusive: a sequence served by a LoRA tenant shows the tenant name; a
     /// sequence served by the base model shows "base". The exclusive: the default
     /// (unset) label is the empty string until it is set at finish.
@@ -1452,6 +2006,29 @@ mod tests {
         // The exclusive: the default label is empty (the unset before finish).
         let default_stats = SchedSeqStats::default();
         assert_eq!(default_stats.model_label, "", "the default model_label is empty until set at finish");
+    }
+
+    // The adaptive-K visibility: the report is shown when QoS is active OR when
+    // speculative decode was enabled (the spec_k > 0), so the operator sees the K the
+    // controller chose even with QoS off (the static spec_draft_max path).
+    #[test]
+    fn sched_stats_report_shows_spec_k_when_sd_enabled_qos_off() {
+        // Inclusive: QoS off + spec_k = 8 (the --num-speculative-tokens, the K-bridge)
+        // -> the report is shown (the spec_k field is visible).
+        let mut stats = SchedSeqStats::default();
+        stats.qos_active = false;
+        stats.spec_k = 8;
+        let report = stats.report();
+        assert!(report.is_some(), "the SD-enabled sequence must report even with QoS off");
+        assert!(report.unwrap().contains("spec_k=8"), "the report must show the K");
+    }
+
+    #[test]
+    fn sched_stats_report_omitted_when_qos_off_and_sd_off() {
+        // Exclusive: QoS off + spec_k = 0 (no speculative decode) -> no report (the no
+        // phantom line for a sequence that had neither QoS nor SD).
+        let stats = SchedSeqStats::default();
+        assert!(stats.report().is_none(), "the no-QoS no-SD sequence must not report");
     }
 
     #[test]
@@ -1483,10 +2060,10 @@ mod tests {
             ctl.record_step(500.0, Regime::Contended, QosClass::Throughput);
         }
         assert!(!ctl.calibration_done());
-        let plan = ctl.plan(&running, &blocks);
+        let plan = ctl.plan(&running, &blocks, false);
         assert_eq!(plan.chunk_size, blocks.static_chunk, "no chunk suppression during calibration");
         assert_eq!(plan.token_budget, blocks.max_num_batched_tokens, "no budget scaling during calibration");
-        let adaptive = ctl.adaptive_plan(&running, &blocks);
+        let adaptive = ctl.adaptive_plan(&running, &blocks, false);
         assert_eq!(adaptive.parallelism_hint, ParallelismHint::Hold, "no parallelism hint during calibration");
         assert!(adaptive.sampling.top_k.is_none(), "no sampling override during calibration");
         assert!(adaptive.kv_demote_threshold.is_none(), "no KV demotion during calibration");
@@ -1504,9 +2081,9 @@ mod tests {
         for _ in 0..200 {
             ctl.record_step(500.0, Regime::Contended, QosClass::Throughput);
         }
-        let plan_after = ctl.plan(&running, &blocks);
+        let plan_after = ctl.plan(&running, &blocks, false);
         assert!(plan_after.chunk_size < blocks.static_chunk, "chunk suppressed after calibration");
-        let adaptive_after = ctl.adaptive_plan(&running, &blocks);
+        let adaptive_after = ctl.adaptive_plan(&running, &blocks, false);
         assert_ne!(adaptive_after.parallelism_hint, ParallelismHint::Hold, "an actuator engages after calibration");
     }
 
@@ -1540,7 +2117,7 @@ mod tests {
         for s in running.iter_mut() {
             s.num_cached_tokens = s.len(); // mark decoding so the pressure is 1.0
         }
-        let plan = ctl.adaptive_plan(&running, &blocks);
+        let plan = ctl.adaptive_plan(&running, &blocks, false);
         assert_eq!(plan.parallelism_hint, ParallelismHint::UseSequenceParallelism);
         // The P-Q4: under contention + a high gain the batch cap drops below the
         // full slot count (floored at 1, the no the controller admitting zero
@@ -1558,7 +2135,7 @@ mod tests {
         }
         assert!(ctl2.calibration_done());
         let running2 = vec![seq_with(Some(100), 50)];
-        let plan2 = ctl2.adaptive_plan(&running2, &blocks);
+        let plan2 = ctl2.adaptive_plan(&running2, &blocks, false);
         assert_eq!(plan2.parallelism_hint, ParallelismHint::IncreaseTp);
     }
 
@@ -1598,7 +2175,7 @@ mod tests {
         assert!(!QosController::should_restore(true, false, false)); // The no resident_empty + the no restoration_event.
     }
 
-    #[test]
+#[test]
     fn decode_pressure_sensor_actively_generating_seqs() {
         // The sensor fix: decode_pressure counts running seqs that are actively
         // generating (output_len > 0), not fully-cached seqs (num_cached_tokens >=
@@ -1655,7 +2232,7 @@ mod tests {
         assert!(ctl.gain() < 0.5, "gain should decay on recovery");
     }
 
-    /// The controller is neutral before it has data: a fresh controller (no
+/// The controller is neutral before it has data: a fresh controller (no
     /// operator config, no calibration) does not act (the no the blind constant
     /// biasing the workload). The plan is the static plan (the full chunk, the
     /// full budget, the neutral actuators) until the calibration derives the
@@ -1683,16 +2260,16 @@ mod tests {
             static_chunk: 8192,
             chunk_floor: 0,
         };
-        let plan = ctl.plan(&[], &blocks);
+        let plan = ctl.plan(&[], &blocks, false);
         assert_eq!(plan.chunk_size, blocks.static_chunk, "the neutral plan uses the full chunk");
         assert_eq!(plan.token_budget, blocks.max_num_batched_tokens, "the neutral plan uses the full budget");
-        let adaptive = ctl.adaptive_plan(&[], &blocks);
+        let adaptive = ctl.adaptive_plan(&[], &blocks, false);
         assert_eq!(adaptive.parallelism_hint, ParallelismHint::Hold, "the neutral plan holds the parallelism");
         assert!(adaptive.sampling.top_k.is_none(), "the neutral plan has no sampling override");
         assert!(adaptive.kv_demote_threshold.is_none(), "the neutral plan has no KV demotion");
     }
 
-    /// The integral gain is derived from the measured ITL, not a blind constant.
+/// The integral gain is derived from the measured ITL, not a blind constant.
     /// A fast workload (the 10ms ITL) derives a larger gain than a slow workload
     /// (the 100ms ITL), so the controller settles on the workload's own
     /// timescale. This is the self-tuning property: the no the operator having to
@@ -1708,7 +2285,7 @@ mod tests {
         assert!(fast.calibration_done());
         let fast_gain = fast.effective().gain_kp.expect("the fast workload derives a gain");
 
-        // The slow workload: 100ms ITL, the same window64-step window.
+        // The slow workload: 100ms ITL, the same 64-step window.
         let mut slow = QosController::new(QosConfig::default());
         slow.cfg.enabled = true;
         for _ in 0..slow.cfg.calibration_steps {
@@ -1729,7 +2306,7 @@ mod tests {
         assert!(fast_gain > 0.0 && fast_gain < 1.0, "the derived gain must be in (0, 1)");
     }
 
-    /// P-Q2: the idle-gap guard is derived from the step p99 after calibration,
+/// P-Q2: the idle-gap guard is derived from the step p99 after calibration,
     /// so it is active by default (no operator config needed). Before
     /// calibration it is None (neutral). An operator-set value still wins.
     #[test]
@@ -1877,7 +2454,7 @@ mod tests {
         };
         // Uncontended (low pressure, low gain): the cap is the full slot count.
         let running = vec![seq_with(Some(100), 50)];
-        let plan = ctl.adaptive_plan(&running, &blocks);
+        let plan = ctl.adaptive_plan(&running, &blocks, false);
         assert_eq!(plan.batch_cap, 32, "uncontended: the cap is the full slot count");
         // Now drive the gain high + the regime contended (high decode pressure).
         for _ in 0..200 {
@@ -1887,7 +2464,7 @@ mod tests {
         for s in contended.iter_mut() {
             s.num_cached_tokens = s.len(); // mark decoding -> pressure 1.0
         }
-        let plan2 = ctl.adaptive_plan(&contended, &blocks);
+        let plan2 = ctl.adaptive_plan(&contended, &blocks, false);
         assert!(
             plan2.batch_cap < 32,
             "contended + high gain: the cap drops below the slot count (got {})",
@@ -1927,7 +2504,7 @@ mod tests {
             chunk_floor: 256,
         };
         let running = vec![seq_with(Some(100), 50)];
-        let plan = ctl.adaptive_plan(&running, &blocks);
+        let plan = ctl.adaptive_plan(&running, &blocks, false);
         // The G5 contract: the AdaptivePlan carries all four QoS actuators. The
         // base StepPlan (chunk + budget + gates) is the live actuator the
         // scheduler consumes today. The other three (parallelism_hint,
@@ -1978,7 +2555,7 @@ mod tests {
         for s in contended.iter_mut() {
             s.num_cached_tokens = s.len();
         }
-        let plan = ctl.adaptive_plan(&contended, &blocks);
+        let plan = ctl.adaptive_plan(&contended, &blocks, false);
         // The contended + over-SLO -> the UseSequenceParallelism hint (the L3/L4
         // router/migrator consumes this).
         assert_eq!(plan.parallelism_hint, ParallelismHint::UseSequenceParallelism);
@@ -1987,6 +2564,210 @@ mod tests {
         assert!(
             plan.kv_demote_threshold.is_some(),
             "high KV pressure must emit a demotion threshold"
+        );
+    }
+
+    // The dynamic-K law (the per-seq rolling prefix-curve knee). The tests seed
+    // the per-seq curve via spec_stats_update (the real signal path) + assert the
+    // knee. The inclusive: a strong curve -> K = the ceiling. The exclusive: a
+    // collapsing curve -> K = the knee (the no wasted verify past the reliable pos).
+    use crate::speculative::spec_stats::spec_stats_update;
+    use crate::speculative::verify::MtpVerifyResult;
+
+    fn res(k: usize, accepted: usize) -> MtpVerifyResult {
+        MtpVerifyResult {
+            accepted_tokens: vec![],
+            continuation_token: 0,
+            num_accepted: accepted,
+            num_proposed: k,
+            target_bound: k.saturating_sub(accepted),
+            grammar_bound: 0,
+        }
+    }
+
+    #[test]
+    fn dynamic_k_strong_curve_holds_ceiling() {
+        // Inclusive: a sequence whose drafter accepts all 8 positions every step
+        // (the strong curve) -> K stays at the ceiling (8).
+        let mut cfg = QosConfig::default();
+        cfg.spec_draft_max = 8;
+        let ctl = QosController::new(cfg);
+        for _ in 0..40 {
+            spec_stats_update("MTP", 100, &res(8, 8)); // every step accepts all 8
+        }
+        assert_eq!(ctl.spec_draft_len_for_seq(100, true), 8, "the strong curve holds the ceiling");
+    }
+
+    #[test]
+    fn dynamic_k_collapsing_curve_finds_knee() {
+        // Exclusive: a sequence whose drafter accepts only the first 2 positions
+        // (the curve collapses at k=3) -> K = 2 (the knee, the no wasted verify
+        // past position 2).
+        let mut cfg = QosConfig::default();
+        cfg.spec_draft_max = 8;
+        let ctl = QosController::new(cfg);
+        for _ in 0..40 {
+            spec_stats_update("MTP", 200, &res(8, 2)); // only 2 of 8 accepted
+        }
+        assert_eq!(ctl.spec_draft_len_for_seq(200, true), 2, "the collapsing curve finds the knee at 2");
+    }
+
+    #[test]
+    fn dynamic_k_per_seq_isolation() {
+        // The per-seq isolation: seq A is strong (K=8), seq B is weak (K=2). They
+        // do NOT share a global K (the no smearing).
+        let mut cfg = QosConfig::default();
+        cfg.spec_draft_max = 8;
+        let ctl = QosController::new(cfg);
+        for _ in 0..40 {
+            spec_stats_update("MTP", 1, &res(8, 8)); // seq 1 strong
+            spec_stats_update("MTP", 2, &res(8, 2)); // seq 2 weak
+        }
+        assert_eq!(ctl.spec_draft_len_for_seq(1, true), 8, "the strong seq keeps the ceiling");
+        assert_eq!(ctl.spec_draft_len_for_seq(2, true), 2, "the weak seq drops to the knee");
+    }
+
+    #[test]
+    fn dynamic_k_no_history_holds_ceiling() {
+        // The no premature shrink: a sequence with no recent verify history (the
+        // empty curve) keeps the ceiling (the no K=1 before data exists).
+        let mut cfg = QosConfig::default();
+        cfg.spec_draft_max = 8;
+        let ctl = QosController::new(cfg);
+        assert_eq!(ctl.spec_draft_len_for_seq(999, true), 8, "the no history -> the ceiling");
+    }
+
+    #[test]
+    fn dynamic_k_dflash_uses_batch_law() {
+        // The DFlash path keeps the batch-scaling law (the no per-seq knee, the
+        // separate-drafter MagicDec). is_mtp=false -> spec_draft_len(false).
+        let mut cfg = QosConfig::default();
+        cfg.spec_draft_max = 8;
+        let mut ctl = QosController::new(cfg);
+        ctl.record_spec_batch_size(1);
+        let k = ctl.spec_draft_len_for_seq(5, false);
+        assert_eq!(k, ctl.spec_draft_len(false), "the DFlash per-seq K == the batch law");
+    }
+
+    #[test]
+    fn spec_draft_len_cost_cap_shrinks_k_under_contention() {
+        // The live cost-aware cap (the dfb7739 spec-speedup law): when a spec step
+        // costs more than the acceptance returns (the contended GPU, the verify is
+        // expensive), the spec_speedup drops below 1 and the K shrinks. The ratio
+        // 1.0 (the spec step ≈ the baseline decode) → the speedup >= 1, the K holds
+        // at the max. The expensive spec step (the 2× the baseline) → the speedup
+        // < 1, the K is capped down.
+        let mut cfg = QosConfig::default();
+        cfg.spec_draft_max = 8;
+        let mut ctl = QosController::new(cfg);
+        // Establish the baseline decode ITL (the itl_ema, the plain tokens/sec).
+        for _ in 0..20 {
+            ctl.record_step(10.0, Regime::Uncontended, QosClass::Throughput);
+        }
+        // High acceptance (the no the break-even guard firing).
+        ctl.record_spec_acceptance(0.9);
+        // The no expensive spec step yet: the spec_step_ema is 0, so the
+        // spec_speedup is the neutral 1.0 → the K holds at the ceiling.
+        assert_eq!(ctl.spec_draft_len(true), 8, "the no contention: the K is the ceiling");
+        // The contended GPU: the spec step costs 2× the baseline decode (the 20ms
+        // vs. the 10ms itl). The speedup = 0.9 × (8+1) × 10 / 20 = 4.05... but the
+        // k pairing uses the measured K. Feed the expensive spec step at K=8.
+        ctl.record_spec_step(20.0, 8);
+        // The spec_step_ema is now 20 (the first measurement), the itl_ema is 10,
+        // the accept is 0.9, the k is 8: the speedup = 0.9 × 9 × 10 / 20 = 4.05,
+        // which is > 1, so the K still holds. To force a shrink, the spec step must
+        // be expensive enough that the speedup < 1: feed a 100ms spec step.
+        for _ in 0..20 {
+            ctl.record_spec_step(100.0, 8);
+        }
+        assert!(
+            ctl.spec_draft_len(true) < 8,
+            "the contended GPU (the expensive verify): the K is capped below the ceiling (got {})",
+            ctl.spec_draft_len(true)
+        );
+    }
+
+    #[test]
+    fn adaptive_plan_caps_k_on_low_kv_headroom() {
+        // The KV-pressure cap: when the pool is nearly full (the low mem_headroom),
+        // the adaptive_plan reduces the spec_draft_len so the K pre-alloc fits. A
+        // full pool (the headroom 0) drops the K to 1 (the plain decode); a half-
+        // full pool halves the K. The cap only reduces (the no an increase over the
+        // speedup-driven K).
+        let mut cfg = QosConfig::default();
+        cfg.enabled = true;
+        cfg.spec_draft_max = 8;
+        cfg.calibration_steps = 4;
+        let mut ctl = QosController::new(cfg);
+        for _ in 0..4 {
+            ctl.observe_calibration(10.0, 0.1, 0.05, Some(100), 8);
+        }
+        assert!(ctl.calibration_done());
+        // The full pool (the free_blocks 0, the total 100): the headroom is 0, the
+        // K is capped to 1.
+        let full = BlockSnapshot {
+            free_blocks: 0,
+            total_blocks: 100,
+            max_num_seqs: 32,
+            max_num_batched_tokens: 16384,
+            static_chunk: 8192,
+            chunk_floor: 256,
+        };
+        let plan = ctl.adaptive_plan(&[], &full, true);
+        assert_eq!(plan.base.spec_draft_len, 1, "the full pool drops the K to 1 (got {})", plan.base.spec_draft_len);
+        // The half-full pool (the free 50, the total 100): the headroom is 0.5, the
+        // K is capped to max_k x 0.5 = 4.
+        let half = BlockSnapshot {
+            free_blocks: 50,
+            total_blocks: 100,
+            max_num_seqs: 32,
+            max_num_batched_tokens: 16384,
+            static_chunk: 8192,
+            chunk_floor: 256,
+        };
+        let plan = ctl.adaptive_plan(&[], &half, true);
+        assert!(plan.base.spec_draft_len <= 4, "the half-full pool caps the K at 4 (got {})", plan.base.spec_draft_len);
+        // The empty pool (the free 100, the total 100): the headroom is 1.0, the K
+        // is uncapped (the speedup-driven value, the 8 before any spec measurement).
+        let empty = BlockSnapshot {
+            free_blocks: 100,
+            total_blocks: 100,
+            max_num_seqs: 32,
+            max_num_batched_tokens: 16384,
+            static_chunk: 8192,
+            chunk_floor: 256,
+        };
+        let plan = ctl.adaptive_plan(&[], &empty, true);
+        assert_eq!(plan.base.spec_draft_len, 8, "the empty pool keeps the K at the ceiling (got {})", plan.base.spec_draft_len);
+    }
+
+    #[test]
+    fn spec_draft_len_dflash_cost_cap_composes_with_batch() {
+        // The DFlash path: the K is the min of the batch-scaled K + the
+        // spec-speedup cap. The high batch (the large K) + the expensive spec
+        // step (the speedup < 1 cap) compose.
+        let mut cfg = QosConfig::default();
+        cfg.spec_draft_max = 8;
+        let mut ctl = QosController::new(cfg);
+        // Establish the baseline decode ITL (the itl_ema).
+        for _ in 0..20 {
+            ctl.record_step(10.0, Regime::Uncontended, QosClass::Throughput);
+        }
+        ctl.record_spec_acceptance(0.9);
+        // The large batch (the K scales up to the max).
+        ctl.record_spec_batch_size(32);
+        // The no expensive spec step yet: the spec_speedup is the neutral 1.0, so
+        // the K holds at the batch-scaled ceiling.
+        assert_eq!(ctl.spec_draft_len(false), 8, "the large batch + the no contention: the K is the ceiling");
+        // The contended GPU: feed an expensive spec step (the 100ms vs. the 10ms
+        // baseline) so the spec_speedup < 1, capping the K below the ceiling.
+        for _ in 0..20 {
+            ctl.record_spec_step(100.0, 8);
+        }
+        assert!(
+            ctl.spec_draft_len(false) < 8,
+            "the large batch + the contention: the K is cost-capped below the ceiling (got {})",
+            ctl.spec_draft_len(false)
         );
     }
 }

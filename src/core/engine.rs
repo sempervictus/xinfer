@@ -8,15 +8,18 @@ use crate::core::sequence::{DecodeSequence, SequenceStatus};
 use crate::core::lora::{DEFAULT_LORA_MAX_BYTES, DEFAULT_LORA_MAX_TENANTS};
 use crate::core::mem_budget::{apply_kv_cache_cap, GpuReserve, MemoryMapSet, PoolBudget};
 use crate::telemetry::Telemetry;
-use crate::utils::env::{moe_offload_auto, qos_enabled};
+use crate::utils::env::{moe_offload_auto, moe_offload_profile, qos_enabled, spec_parallel_draft};
 use crate::core::GenerationOutput;
 use crate::models::layers::distributed::Comm;
 #[cfg(feature = "nccl")]
 use crate::models::layers::distributed::Id;
 use crate::models::layers::VarBuilderX;
 use crate::runner::{
-    receive_local, send_and_expect_ack, send_local, MessageType, RunnerInitRequest,
+    receive_local, send_and_expect_ack, send_local, MessageType, NcclId, RunnerInitRequest,
+    SpecSeqStatsData, SpecStepOut,
 };
+use crate::speculative::{uses_builtin_mtp, uses_dflash};
+use crate::speculative::spec_stats::{init_drafter_profile, preferred_drafter, spec_seq_stats_data};
 use crate::server::logger::ChatCompletionLogger;
 use crate::server::parser::{detect_prefilled_reasoning_end_marker, ToolConfig};
 use crate::server::{EmbeddingStrategy, UsageResponse};
@@ -117,14 +120,27 @@ pub struct LLMEngine {
     pub model_type: ModelType,
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
-    pub guidance_tokens: GuidanceTokens,
-/// The live physical memory map. One device map per rank plus one host map,
+pub guidance_tokens: GuidanceTokens,
+    /// The live physical memory map. One device map per rank plus one host map,
     /// owned by value on the engine (no internal lock, no Arc). Mutated under the
     /// engine write lock (the boot carve, the grow, the reclaim, the probe
     /// refresh). The scheduler and the QoS controller read it for the physical
     /// pressure signal, which unlike the block occupancy is aware of the idle
     /// VRAM.
     mem_map: MemoryMapSet,
+    seq_spec_stats: std::sync::Mutex<HashMap<usize, SpecSeqStatsData>>,
+    /// The cached CUDA graph pool usage (the current + peak bytes, the last
+    /// refresh time). The graph_pool_usage is a CUDA driver call that can block
+    /// (the GPU busy), so it's cached + refreshed on (the no every scrape).
+    /// The scrape reads the cache (the immediate, the no the 25s stall).
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    graph_pool_cache: std::sync::Mutex<(u64, u64, std::time::Instant)>,
+    /// The seqs for which `notify_runner_finished` has already run (the idempotency
+    /// guard). A normal finish fires this from two callers (the engine `finish_step`
+    /// + the server stream-end handler); without the guard the second call re-sends
+    /// `FinishDecode` on the same subprocess socket, desyncing the request/ack
+    /// framing by one message (the "Unexpected acknowledgment value" + the hang).
+    notified_seqs: HashSet<usize>,
 }
 
 impl LLMEngine {
@@ -290,7 +306,7 @@ impl LLMEngine {
                     log_info!("CUDA graph capture disabled by --disable-cuda-graph");
                 } else if crate::utils::is_no_cuda_graph_supprt(arch.clone()) {
                     log_info!("{arch} does not supprt CUDA graph");
-                } else if crate::utils::env::moe_offload_profile() {
+                } else if moe_offload_profile() {
                     crate::log_info!(
                         "CUDA graph disabled: XINFER_MOE_OFFLOAD_PROFILE syncs every MoE call"
                     );
@@ -448,7 +464,7 @@ impl LLMEngine {
                         dtype: dtype.into(),
                         is_rope_i,
                         #[cfg(feature = "nccl")]
-                        nccl_id: crate::runner::NcclId(nccl_id.clone()),
+                        nccl_id: NcclId(nccl_id.clone()),
                     });
 
                     send_and_expect_ack(&mut stream, &init_msg, "initialize", global_rank)?;
@@ -888,6 +904,10 @@ let reported = match receive_local(&mut stream, false)? {
             model_name,
             guidance_tokens,
             mem_map,
+            seq_spec_stats: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            graph_pool_cache: std::sync::Mutex::new((0, 0, std::time::Instant::now())),
+            notified_seqs: HashSet::new(),
         }));
 
         Self::start_engine(engine.clone());
@@ -1331,11 +1351,27 @@ pub fn get_available_kv_tokens(&self) -> usize {
         self.scheduler.get_available_kv_tokens()
     }
 
-    fn take_prompt_replay_token_ids(&mut self, seq_id: usize) -> Option<Vec<u32>> {
+fn take_prompt_replay_token_ids(&mut self, seq_id: usize) -> Option<Vec<u32>> {
         self.seq_prompt_replays.remove(&seq_id)
     }
 
     pub fn notify_runner_finished(&mut self, id: usize) -> Result<()> {
+        // The idempotency guard: a normal finish fires this from two callers (the
+        // engine `finish_step` + the server stream-end handler). Only the FIRST call
+        // does the work (the `FinishDecode` send, the spec-stats capture); the second
+        // is a no-op. Without this the second call re-sends `FinishDecode` on the same
+        // subprocess socket, desyncing the request/ack framing by one message (the
+        // "Unexpected acknowledgment value" + the hang).
+        if !self.notified_seqs.insert(id) {
+            return Ok(());
+        }
+        // The capture-before-drop: pull the per-seq spec stats from the runner
+        // BEFORE the `FinishDecode` message drops them runner-side, so the
+        // server's end-of-sequence report reads a surviving in-process copy.
+        let spec_stats = spec_seq_stats_data(id);
+        if !spec_stats.mechanism.is_empty() {
+            self.seq_spec_stats.lock().unwrap().insert(id, spec_stats);
+        }
         match &mut *self.runners.write() {
             RunnerType::Thread(model_runner) => Ok(model_runner.finished(id)),
             RunnerType::Process(ref mut runner_streams) => {
@@ -1361,7 +1397,7 @@ pub fn get_available_kv_tokens(&self) -> usize {
                     crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
                 }
 Ok(())
-            }
+}
         }
     }
 
@@ -1369,6 +1405,11 @@ Ok(())
     /// server's per-sequence display. Delegates to the scheduler (same process).
     pub fn get_seq_report(&self, seq_id: usize) -> Option<SeqReport> {
         self.scheduler.get_seq_report(seq_id)
+    }
+
+    /// The cached per-seq spec stats (for the server's end-of-sequence report).
+    pub fn get_seq_spec_stats(&self, seq_id: usize) -> Option<SpecSeqStatsData> {
+        self.seq_spec_stats.lock().unwrap().get(&seq_id).cloned()
     }
 
     /// Release hybrid GDN/Mamba active slots queued by scheduler-side abort paths.
@@ -1423,29 +1464,11 @@ Ok(())
             }
         }
 
-        // Pre-allocate blocks for speculative verify positions before cloning sequences
-        if !is_prefill {
-            if self.econfig.num_speculative_tokens.unwrap_or(0) > 0
-                && (crate::speculative::uses_builtin_mtp(&self.econfig)
-                    || crate::speculative::uses_dflash(&self.econfig))
-            {
-                let spec_tokens = self.econfig.num_speculative_tokens.unwrap_or(0);
-                self.scheduler
-                    .pre_allocate_mtp_blocks(&scheduled_ids, spec_tokens + 1);
-            }
-        }
-
-        let seqs = self.scheduler.get_sequences(&scheduled_ids);
-        let owned_seqs: Vec<Sequence> = seqs
-            .iter()
-            .map(|s| {
-                if is_prefill {
-                    s.clone_for_prefill_forward()
-                } else {
-                    (*s).clone()
-                }
-            })
-            .collect();
+        // The single-writer step view (the no write-after-snapshot): the Scheduler does
+        // ALL the writes (the speculative pre-alloc) + the freeze (the Sequence snapshot) in ONE
+        // atomic call. No caller can interleave a write between the snapshot and the forward. The
+        // gate is the speculative decode ENABLED + the decode step (NOT the single-sequence check).
+        let owned_seqs = self.scheduler.prepare_step_view(&scheduled_ids, is_prefill);
         Ok(Some((scheduled_ids, is_prefill, owned_seqs)))
     }
 
@@ -1571,7 +1594,7 @@ Ok(())
     fn run_mtp_on_local_streams(
         runner_streams: &mut Vec<LocalStream>,
         request: &MessageType,
-    ) -> Result<Vec<Vec<u32>>> {
+    ) -> Result<Vec<SpecStepOut>> {
         // MTP executes tensor-parallel attention/MoE kernels and therefore every
         // local runner must enter the same NCCL collectives. Send the request to
         // all ranks before waiting for any response; waiting on rank 0 first would
@@ -1581,7 +1604,7 @@ Ok(())
             .map(|s| s.try_clone().expect("clone failed"))
             .collect();
 
-        let all_outputs: Result<Vec<Vec<Vec<u32>>>> = cloned_streams
+        let all_outputs: Result<Vec<Vec<SpecStepOut>>> = cloned_streams
             .into_par_iter()
             .map(|mut stream| {
                 send_local(&mut vec![stream.try_clone()?], request, false)?;
@@ -1607,11 +1630,11 @@ Ok(())
     }
 
     /// Run MTP speculative decode forward pass.
-    /// Returns Vec<Vec<u32>> where each inner vec contains all accepted tokens for that sequence.
+    /// Returns Vec<SpecStepOut> where each carries the accepted tokens + the next-step K.
     fn run_forward_mtp(
         runners: &Arc<RwLock<RunnerType>>,
         owned_seqs: &[Sequence],
-    ) -> Result<Vec<Vec<u32>>> {
+    ) -> Result<Vec<SpecStepOut>> {
         match &mut *runners.write() {
             RunnerType::Thread(model_runner) => {
                 let seq_refs: Vec<&Sequence> = owned_seqs.iter().collect();
@@ -1873,6 +1896,9 @@ Ok(())
                     self.seq_prefilled_reasoning_end.remove(&seq_id);
                     self.seq_prompt_replays.remove(&seq_id);
                     let _ = self.notify_runner_finished(seq_id);
+                    // Prune the idempotency guard (the seq is fully cleaned up now, the
+                    // no an unbounded `notified_seqs` growth under long-running service).
+                    self.notified_seqs.remove(&seq_id);
                     if self.econfig.server_mode.unwrap_or(true) {
                         self.scheduler.print_free_blocks();
                     }
@@ -2014,6 +2040,8 @@ Ok(())
                 self.scheduler.cancel(seq_id);
                 // Ensure model-side per-sequence state (e.g., Qwen3.5 Mamba cache slot) is released.
                 let _ = self.notify_runner_finished(seq_id);
+                // Prune the idempotency guard (the seq is fully cleaned up now).
+                self.notified_seqs.remove(&seq_id);
                 if let Some(_) = self.active_requests.get(&seq_id) {
                     self.active_requests.remove(&seq_id);
                 }
@@ -2486,6 +2514,10 @@ Ok(())
         };
         telemetry.publish_lora_gauges(lora_registry);
         telemetry.publish_spec_gauges();
+        // The spec-k live feedback (the inputs + the outputs of the dynamic K
+        // law, so the operator can see how the K is being driven).
+        let is_mtp = uses_builtin_mtp(&self.econfig);
+        telemetry.publish_spec_feedback(&self.scheduler.policy().spec_feedback(is_mtp));
         // The runtime memory + scheduling gauges (the CUDA graph pool, the per-step
         // budget, the CPU KV blocks, the Mamba active/prefix split). The values
         // come from the engine config (the static) + the scheduler's
@@ -2496,9 +2528,18 @@ Ok(())
         // runner is not Thread-mode or the pool is unavailable). The graph
         // capturer is only present when the cuda + graph features are on.
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        let (graph_current_bytes, graph_peak_bytes) = match &*self.runners.read() {
-            RunnerType::Thread(model_runner) => model_runner.decode_capturer.graph_pool_usage(),
-            _ => (0, 0),
+        let (graph_current_bytes, graph_peak_bytes) = {
+            // The cached graph pool usage (the no the blocking CUDA driver call on
+            // every scrape). Refresh the cache every 5s (the graph pool usage is
+            // slow-changing, the 5s refresh is fresh enough for the /metrics).
+            let mut cache = self.graph_pool_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.2.elapsed() > std::time::Duration::from_secs(5) {
+                if let RunnerType::Thread(model_runner) = &*self.runners.read() {
+                    let (cur, peak) = model_runner.decode_capturer.graph_pool_usage();
+                    *cache = (cur, peak, std::time::Instant::now());
+                }
+            }
+            (cache.0, cache.1)
         };
         #[cfg(not(all(feature = "cuda", feature = "graph")))]
         let (graph_current_bytes, graph_peak_bytes) = (0, 0);
@@ -2751,13 +2792,13 @@ Ok(())
         Ok((outputs, prompt_tokens))
     }
 
-    pub fn start_engine(engine: Arc<RwLock<Self>>) {
+pub fn start_engine(engine: Arc<RwLock<Self>>) {
         GLOBAL_RT.spawn(async move {
             let engine = engine.clone();
             let (is_pd_server, runners, mtp_enabled, dflash_enabled) = {
                 let guard = engine.read();
-                let has_mtp = crate::speculative::uses_builtin_mtp(&guard.econfig);
-                let has_dflash = crate::speculative::uses_dflash(&guard.econfig);
+                let has_mtp = uses_builtin_mtp(&guard.econfig);
+                let has_dflash = uses_dflash(&guard.econfig);
                 (
                     guard.is_pd_mode() && guard.is_pd_server(),
                     guard.runners.clone(),
@@ -2765,6 +2806,10 @@ Ok(())
                     has_dflash,
                 )
             };
+            // Initialize the global drafter profile when any drafter is active (the
+            // MTP or the DFlash), so the dynamic drafter choice (the
+            // `DrafterProfile::select`) has a live acceptance signal to read.
+            init_drafter_profile(mtp_enabled || dflash_enabled);
             loop {
                 let idle = {
                     let guard = engine.read();
@@ -2795,12 +2840,53 @@ Ok(())
                 // Engine lock released -- server can accept new requests during forward pass
 
                 if let Some((scheduled_ids, is_prefill, owned_seqs)) = prep {
-                    let use_dflash = dflash_enabled && !is_prefill && owned_seqs.len() == 1;
-                    let use_mtp =
-                        !use_dflash && mtp_enabled && !is_prefill && owned_seqs.len() == 1;
+                    // The dynamic-K drathe c1bf8ac37 feature): the MTP path returns
+                    // per-seq `SpecStepOut` (the tokens + the runner-computed next-K).
+                    // The next-K feedback is recorded so the NEXT step's pre-alloc uses
+                    // the runner's real signal (the no the scheduler guessing from an
+                    // empty cross-process global). The DFlash + plain paths return
+                    // plain token vecs (the no next-K feedback).
+                    let mut mtp_next_k: Vec<usize> = Vec::new();
+                    // The dynamic drafter choice: when the drafter profile has acceptance data
+                    // (the spec-decode dynamic-drafter feature), `preferred_drafter` picks the
+                    // drafter kind for the current workload (the 0 = the MTP, the 1 = the DFlash,
+                    // the 2 = the chained). It OVERRIDES the static enable flags so the right
+                    // drafter serves the right workload. When the profile is empty (the no data
+                    // yet) or disabled, the static flags stand (the prior behavior). The kind 2
+                    // (the chained) has no dedicated path on this branch (the chain seam is the
+                    // llg work), so it falls back to the DFlash (the higher-acceptance drafter).
+                    let preferred = preferred_drafter();
+                    let prefer_dflash = matches!(preferred, Some(1) | Some(2));
+                    let prefer_mtp = matches!(preferred, Some(0));
+// The MTP + DFlash paths both batch natively (the run_mtp_decode_batch /
+                    // the run_dflash_decode_batch).
+                    // The shared speculative-draft slot cap (the MTP + DFlash parity):
+                    // both drafters batch up to spec_parallel_draft() sequences (the
+                    // default 0 = single-seq only, the origin/main behavior); sequences
+                    // beyond the cap fall back to plain decode. The MTP + DFlash verify
+                    // buffers are sized to this cap (runner.rs), so the verify batch
+                    // always fits. Parallel drafting is a per-instance concern: each
+                    // engine has its own owned_seqs, so two instances can both draft
+                    // concurrently.
+                    // The cap: XINFER_SPEC_PARALLEL_DRAFT when set, else unbounded
+                    // (usize::MAX) — no static fallback to max_num_seqs.
+                    let spec_slots = spec_parallel_draft()
+                        .unwrap_or(usize::MAX);
+                    let dflash_ok = owned_seqs.len() <= spec_slots;
+                    let use_dflash = dflash_enabled && !is_prefill && dflash_ok
+                        && (!prefer_mtp || preferred.is_none());
+                    let mtp_ok = owned_seqs.len() <= spec_slots;
+                    let use_mtp = mtp_enabled && !use_dflash && !is_prefill && mtp_ok
+                        && (!prefer_dflash || preferred.is_none());
 
                     let forward_result: Result<Vec<Vec<u32>>> = if use_mtp {
-                        Self::run_forward_mtp(&runners, &owned_seqs)
+                        match Self::run_forward_mtp(&runners, &owned_seqs) {
+                            Ok(step_outs) => {
+                                mtp_next_k = step_outs.iter().map(|o| o.next_k).collect();
+                                Ok(step_outs.into_iter().map(|o| o.tokens).collect())
+                            }
+                            Err(e) => Err(e),
+                        }
                     } else if use_dflash {
                         Self::run_forward_dflash(&runners, &owned_seqs)
                     } else {
@@ -2811,6 +2897,11 @@ Ok(())
                     match forward_result {
                         Ok(multi_output_ids) => {
                             let mut guard = engine.write();
+                            // The dynamic-K feedback: record the runner-reported per-seq next-K
+                            // so the NEXT step's pre-alloc uses the runner's real signal.
+                            if !mtp_next_k.is_empty() {
+                                guard.scheduler.record_spec_k_feedback(&scheduled_ids, &mtp_next_k);
+                            }
                             match guard.finish_step(scheduled_ids, is_prefill, multi_output_ids) {
                                 Ok(n) => task_processed = n,
                                 Err(e) => {

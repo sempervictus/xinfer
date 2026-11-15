@@ -297,7 +297,7 @@ impl Message {
 
 #[pymethods]
 impl EngineConfig {
-#[new]
+    #[new]
     #[pyo3(signature = (model_id=None, weight_path=None, weight_file=None,
         hf_token=None, hf_token_path=None, enforce_parser=None,
         max_num_seqs=Some(32), config_model_len=None, max_model_len=Some(1024), max_tokens=None,
@@ -309,8 +309,8 @@ impl EngineConfig {
         pd_server_prefix_cache_ratio=None, pd_client_prefix_cache_ratio=None, yarn_scaling_factor=None,
         disable_reasoning=false, disable_cuda_graph=false, prefill_chunk_size=Some(8192),
         num_nodes=1, node_rank=0, master_addr=None, master_port=29500,
-        enable_tool_grammar=false, num_speculative_tokens=None,
-        draft_model=None, lora=None,))]
+enable_tool_grammar=false, num_speculative_tokens=None,
+         draft_model=None, lora=None,))]
     pub fn from_args(
         model_id: Option<String>,
         weight_path: Option<String>,
@@ -415,8 +415,8 @@ impl EngineConfig {
             num_speculative_tokens,
             draft_model,
             lora: lora.unwrap_or_default(),
-            qos: QosConfig::default(),
             enable_tool_grammar,
+            qos: QosConfig::default(),
         }
     }
 }

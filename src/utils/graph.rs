@@ -390,7 +390,11 @@ pub struct GraphCaptureVars {
     pub outputs: BTreeMap<usize, Tensor>,
 }
 
-pub struct MtpGraphCaptureVars {
+/// The per-verify_len input tensors for the MTP verify graph capture. Each
+/// verify_len has its own set of input buffers (the `input_ids`, `positions`,
+/// `slot_mapping`, etc. are sized by the verify_len), so the replay for a
+/// given verify_len uses the matching-sized buffers.
+pub struct MtpInputTensors {
     pub input_ids: Tensor,
     pub positions: Tensor,
     pub mamba_slot_mapping: Tensor,
@@ -409,6 +413,14 @@ pub struct MtpGraphCaptureVars {
     pub flashinfer_batch_indices: Tensor,
     #[cfg(feature = "flashinfer")]
     pub flashinfer_positions: Tensor,
+}
+
+pub struct MtpGraphCaptureVars {
+    /// The per-verify_len input tensors (each verify_len has its own sized
+    /// buffers, so the replay uses the matching-sized inputs).
+    pub inputs: BTreeMap<usize, MtpInputTensors>,
+    /// The per-verify_len captured output tensors (the graph replay writes into
+    /// these).
     pub outputs: BTreeMap<usize, Tensor>,
 }
 
@@ -870,184 +882,200 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             attention_rs::set_graph_workspace_domain(attention_rs::GraphWorkspaceDomain::MtpGraph);
         let _prefill_guard = set_linear_is_prefill(true);
         self.device = Some(device.clone());
-        let verify_len = mtp_num_speculative + 1;
         let max_num_blocks = (self.max_model_len + self.block_size - 1) / self.block_size;
 
-        // Capture must use in-bounds, decode-consistent page metadata. Zeroed
-        // cu_seqlens / last_len=max_model_len previously caused FlashInfer/GDN
-        // OOB during capture; multirank NCCL sync surfaces that as
-        // CUDA_ERROR_ILLEGAL_ADDRESS on InputMetadata drop.
-        let input_ids = Tensor::zeros((verify_len,), DType::U32, device)?;
-        let positions = Tensor::zeros((verify_len,), DType::I64, device)?;
-        let mamba_slot_mapping = Tensor::zeros((1,), DType::I64, device)?;
-        let slot_mapping = Tensor::zeros((verify_len,), DType::I64, device)?;
-        let context_lens = Tensor::from_vec(vec![self.max_model_len as u32], (1,), device)?;
-        let block_tables = Tensor::zeros((1, max_num_blocks), DType::U32, device)?;
-        let cu_seqlens_q = Tensor::from_vec(vec![0u32, verify_len as u32], (2,), device)?;
-        let cu_seqlens_k = Tensor::from_vec(vec![0u32, self.max_model_len as u32], (2,), device)?;
-
-        #[cfg(feature = "flashinfer")]
-        let last_page_len = if self.max_model_len == 0 {
-            0u32
-        } else {
-            ((self.max_model_len - 1) % self.block_size + 1) as u32
-        };
-
-        #[cfg(feature = "flashinfer")]
-        let (flashinfer_indptr, flashinfer_indices, flashinfer_last_len) = {
-            let indices: Vec<u32> = (0..max_num_blocks as u32).collect();
-            (
-                Tensor::from_vec(vec![0u32, max_num_blocks as u32], (2,), device)?,
-                Tensor::from_vec(indices, (max_num_blocks,), device)?,
-                Tensor::from_vec(vec![last_page_len], (1,), device)?,
-            )
-        };
-        #[cfg(feature = "flashinfer")]
-        let flashinfer_batch_indices = Tensor::zeros((verify_len,), DType::U32, device)?;
-        #[cfg(feature = "flashinfer")]
-        let flashinfer_positions = {
-            // Mirror runtime MTP verify append positions at max context:
-            // [max_model_len - verify_len, ..., max_model_len - 1].
-            let start = self.max_model_len.saturating_sub(verify_len) as u32;
-            let pos: Vec<u32> = (0..verify_len as u32).map(|i| start + i).collect();
-            Tensor::from_vec(pos, (verify_len,), device)?
-        };
-
-        #[cfg(feature = "flashinfer")]
-        let use_flashinfer = self.flashinfer_kv_params.is_some();
-        #[cfg(not(feature = "flashinfer"))]
-        let use_flashinfer = false;
-
-        let capture_in_warmup = use_flashinfer;
-
-        #[cfg(feature = "flashinfer")]
-        let flashinfer_metadata = if let Some(params) = self.flashinfer_kv_params {
-            let indptr_host = vec![0u32, max_num_blocks as u32];
-            let kv_len_arr_host = vec![self.max_model_len as u32];
-            let q_cu_seqlens_host = vec![0u32, verify_len as u32];
-            let last_len_host = vec![last_page_len];
-
-            let prefill_plan_info = attention_rs::flashinfer::graph_prefill_plan(
-                device,
-                &q_cu_seqlens_host,
-                &indptr_host,
-                &kv_len_arr_host,
-                verify_len as u32,
-                1,
-                params.num_qo_heads,
-                params.num_kv_heads,
-                params.head_dim,
-                params.page_size,
-                params.out_dtype,
-                None,
-                Some(params.kv_dtype),
-            )?;
-
-            Some(attention_rs::FlashInferMetadata {
-                indptr: flashinfer_indptr.clone(),
-                indptr_host,
-                indices: flashinfer_indices.clone(),
-                last_len: flashinfer_last_len.clone(),
-                last_len_host: Some(last_len_host),
-                kv_len_arr_host: Some(kv_len_arr_host),
-                total_num_rows: Some(verify_len as u32),
-                batch_indices: Some(flashinfer_batch_indices.clone()),
-                positions: Some(flashinfer_positions.clone()),
-                use_cuda_graph: true,
-                decode_plan_info: None,
-                prefill_plan_info: Some(prefill_plan_info),
-                mla_decode_plan_info: None,
-                mla_prefill_plan_info: None,
-            })
-        } else {
-            None
-        };
-        #[cfg(not(feature = "flashinfer"))]
-        let flashinfer_metadata = None;
-
-        let input_metadata = InputMetadata {
-            is_prefill: true,
-            is_mla: self.is_mla,
-            sequence_ids: Some(vec![0]),
-            mamba_slot_mapping: Some(mamba_slot_mapping.clone()),
-            slot_mapping: slot_mapping.clone(),
-            block_tables: Some(block_tables.clone()),
-            block_tables_host: None,
-            context_lens_host: None,
-            context_lens: Some(context_lens.clone()),
-            cu_seqlens_q: Some(cu_seqlens_q.clone()),
-            cu_seqlens_k: Some(cu_seqlens_k.clone()),
-            max_seqlen_q: verify_len,
-            max_seqlen_k: self.max_model_len,
-            max_context_len: self.max_model_len,
-            seqlens: None,
-            flashinfer_metadata,
-            is_mtp_verify: true,
-        };
-
+        // Capture a verify graph for EVERY draft length 1..=mtp_num_speculative
+        // (the verify_len = k + 1 for each k). The dynamic-K path (the per-seq
+        // spec_k in 0..=mtp_num_speculative) then always has a captured graph to
+        // replay (the no a non-graph fallback fallback). Each length is its own
+        // capture session (the start_capture/forward/end_capture), stored in the
+        // outputs BTreeMap keyed by verify_len.
         let mut outputs = BTreeMap::<usize, Tensor>::new();
+        let mut inputs = BTreeMap::<usize, MtpInputTensors>::new();
         let _guard = candle_core::cuda_backend::cuda_param_cache_scope(true);
 
-        for phase in CapturePhase::ALL {
-            let should_capture =
-                !phase.is_cache_prewarm() && (!phase.is_warmup() || capture_in_warmup);
-            if should_capture {
-                self.model.start_capture(verify_len)?;
-            }
-            if phase.is_warmup() {
-                let _ = self.model.forward(
-                    &input_ids,
-                    &positions,
-                    kv_caches,
-                    &input_metadata,
-                    false,
-                )?;
-                #[cfg(feature = "cuda")]
-                if !should_capture {
-                    device.synchronize()?;
-                }
+        for verify_len in 1..=(mtp_num_speculative + 1) {
+            // Capture must use in-bounds, decode-consistent page metadata. Zeroed
+            // cu_seqlens / last_len=max_model_len previously caused FlashInfer/GDN
+            // OOB during capture; multirank NCCL sync surfaces that as
+            // CUDA_ERROR_ILLEGAL_ADDRESS on InputMetadata drop.
+            let input_ids = Tensor::zeros((verify_len,), DType::U32, device)?;
+            let positions = Tensor::zeros((verify_len,), DType::I64, device)?;
+            let mamba_slot_mapping = Tensor::zeros((1,), DType::I64, device)?;
+            let slot_mapping = Tensor::zeros((verify_len,), DType::I64, device)?;
+            let context_lens = Tensor::from_vec(vec![self.max_model_len as u32], (1,), device)?;
+            let block_tables = Tensor::zeros((1, max_num_blocks), DType::U32, device)?;
+            let cu_seqlens_q = Tensor::from_vec(vec![0u32, verify_len as u32], (2,), device)?;
+            let cu_seqlens_k = Tensor::from_vec(vec![0u32, self.max_model_len as u32], (2,), device)?;
+
+            #[cfg(feature = "flashinfer")]
+            let last_page_len = if self.max_model_len == 0 {
+                0u32
             } else {
-                let out = self.model.forward(
-                    &input_ids,
-                    &positions,
-                    kv_caches,
-                    &input_metadata,
-                    false,
+                ((self.max_model_len - 1) % self.block_size + 1) as u32
+            };
+
+            #[cfg(feature = "flashinfer")]
+            let (flashinfer_indptr, flashinfer_indices, flashinfer_last_len) = {
+                let indices: Vec<u32> = (0..max_num_blocks as u32).collect();
+                (
+                    Tensor::from_vec(vec![0u32, max_num_blocks as u32], (2,), device)?,
+                    Tensor::from_vec(indices, (max_num_blocks,), device)?,
+                    Tensor::from_vec(vec![last_page_len], (1,), device)?,
+                )
+            };
+            #[cfg(feature = "flashinfer")]
+            let flashinfer_batch_indices = Tensor::zeros((verify_len,), DType::U32, device)?;
+            #[cfg(feature = "flashinfer")]
+            let flashinfer_positions = {
+                // Mirror runtime MTP verify append positions at max context:
+                // [max_model_len - verify_len, ..., max_model_len - 1].
+                let start = self.max_model_len.saturating_sub(verify_len) as u32;
+                let pos: Vec<u32> = (0..verify_len as u32).map(|i| start + i).collect();
+                Tensor::from_vec(pos, (verify_len,), device)?
+            };
+
+            #[cfg(feature = "flashinfer")]
+            let use_flashinfer = self.flashinfer_kv_params.is_some();
+            #[cfg(not(feature = "flashinfer"))]
+            let use_flashinfer = false;
+
+            let capture_in_warmup = use_flashinfer;
+
+            #[cfg(feature = "flashinfer")]
+            let flashinfer_metadata = if let Some(params) = self.flashinfer_kv_params {
+                let indptr_host = vec![0u32, max_num_blocks as u32];
+                let kv_len_arr_host = vec![self.max_model_len as u32];
+                let q_cu_seqlens_host = vec![0u32, verify_len as u32];
+                let last_len_host = vec![last_page_len];
+
+                let prefill_plan_info = attention_rs::flashinfer::graph_prefill_plan(
+                    device,
+                    &q_cu_seqlens_host,
+                    &indptr_host,
+                    &kv_len_arr_host,
+                    verify_len as u32,
+                    1,
+                    params.num_qo_heads,
+                    params.num_kv_heads,
+                    params.head_dim,
+                    params.page_size,
+                    params.out_dtype,
+                    None,
+                    Some(params.kv_dtype),
                 )?;
-                outputs.insert(verify_len, out);
+
+                Some(attention_rs::FlashInferMetadata {
+                    indptr: flashinfer_indptr.clone(),
+                    indptr_host,
+                    indices: flashinfer_indices.clone(),
+                    last_len: flashinfer_last_len.clone(),
+                    last_len_host: Some(last_len_host),
+                    kv_len_arr_host: Some(kv_len_arr_host),
+                    total_num_rows: Some(verify_len as u32),
+                    batch_indices: Some(flashinfer_batch_indices.clone()),
+                    positions: Some(flashinfer_positions.clone()),
+                    use_cuda_graph: true,
+                    decode_plan_info: None,
+                    prefill_plan_info: Some(prefill_plan_info),
+                    mla_decode_plan_info: None,
+                    mla_prefill_plan_info: None,
+                })
+            } else {
+                None
+            };
+            #[cfg(not(feature = "flashinfer"))]
+            let flashinfer_metadata = None;
+
+            let input_metadata = InputMetadata {
+                is_prefill: true,
+                is_mla: self.is_mla,
+                sequence_ids: Some(vec![0]),
+                mamba_slot_mapping: Some(mamba_slot_mapping.clone()),
+                slot_mapping: slot_mapping.clone(),
+                block_tables: Some(block_tables.clone()),
+                block_tables_host: None,
+                context_lens_host: None,
+                context_lens: Some(context_lens.clone()),
+                cu_seqlens_q: Some(cu_seqlens_q.clone()),
+                cu_seqlens_k: Some(cu_seqlens_k.clone()),
+                max_seqlen_q: verify_len,
+                max_seqlen_k: self.max_model_len,
+                max_context_len: self.max_model_len,
+                seqlens: None,
+                flashinfer_metadata,
+                is_mtp_verify: true,
+            };
+
+            for phase in CapturePhase::ALL {
+                let should_capture =
+                    !phase.is_cache_prewarm() && (!phase.is_warmup() || capture_in_warmup);
+                if should_capture {
+                    self.model.start_capture(verify_len)?;
+                }
+                if phase.is_warmup() {
+                    let _ = self.model.forward(
+                        &input_ids,
+                        &positions,
+                        kv_caches,
+                        &input_metadata,
+                        false,
+                    )?;
+                    #[cfg(feature = "cuda")]
+                    if !should_capture {
+                        device.synchronize()?;
+                    }
+                } else {
+                    let out = self.model.forward(
+                        &input_ids,
+                        &positions,
+                        kv_caches,
+                        &input_metadata,
+                        false,
+                    )?;
+                    outputs.insert(verify_len, out);
+                }
+                if should_capture {
+                    self.model.end_capture(!phase.is_warmup())?;
+                }
+                #[cfg(feature = "cuda")]
+                device.synchronize()?;
             }
-            if should_capture {
-                self.model.end_capture(!phase.is_warmup())?;
-            }
-            #[cfg(feature = "cuda")]
-            device.synchronize()?;
+
+            crate::log_warn!(
+                "Captured MTP verify graph len={} (flashinfer={})",
+                verify_len,
+                use_flashinfer
+            );
+            // The store the per-length input tensors (they are loop-local, sized
+            // for this verify_len). The replay_mtp looks them up by verify_len.
+            inputs.insert(
+                verify_len,
+                MtpInputTensors {
+                    input_ids,
+                    positions,
+                    mamba_slot_mapping,
+                    slot_mapping,
+                    context_lens,
+                    block_tables,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    #[cfg(feature = "flashinfer")]
+                    flashinfer_indptr,
+                    #[cfg(feature = "flashinfer")]
+                    flashinfer_indices,
+                    #[cfg(feature = "flashinfer")]
+                    flashinfer_last_len,
+                    #[cfg(feature = "flashinfer")]
+                    flashinfer_batch_indices,
+                    #[cfg(feature = "flashinfer")]
+                    flashinfer_positions,
+                },
+            );
         }
 
-        crate::log_warn!(
-            "Captured MTP verify graph len={} (flashinfer={})",
-            verify_len,
-            use_flashinfer
-        );
-
         self.mtp_graph_vars = Some(MtpGraphCaptureVars {
-            input_ids,
-            positions,
-            mamba_slot_mapping,
-            slot_mapping,
-            context_lens,
-            block_tables,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            #[cfg(feature = "flashinfer")]
-            flashinfer_indptr,
-            #[cfg(feature = "flashinfer")]
-            flashinfer_indices,
-            #[cfg(feature = "flashinfer")]
-            flashinfer_last_len,
-            #[cfg(feature = "flashinfer")]
-            flashinfer_batch_indices,
-            #[cfg(feature = "flashinfer")]
-            flashinfer_positions,
+            inputs,
             outputs,
         });
         Ok(())
@@ -1078,60 +1106,62 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         if !mtp_vars.outputs.contains_key(&verify_len) {
             candle_core::bail!("MTP verify graph for len {} is not captured!", verify_len);
         }
+        // The per-length input tensors (sized for this verify_len).
+        let inputs = &mtp_vars.inputs[&verify_len];
 
-        mtp_vars.input_ids.zero_()?;
-        mtp_vars.input_ids.copy_(input_ids, 0)?;
-        mtp_vars.positions.zero_()?;
-        mtp_vars.positions.copy_(positions, 0)?;
+        inputs.input_ids.zero_()?;
+        inputs.input_ids.copy_(input_ids, 0)?;
+        inputs.positions.zero_()?;
+        inputs.positions.copy_(positions, 0)?;
 
         if let Some(ms_mapping) = input_metadata.mamba_slot_mapping.as_ref() {
-            mtp_vars.mamba_slot_mapping.zero_()?;
-            mtp_vars.mamba_slot_mapping.copy_(ms_mapping, 0)?;
+            inputs.mamba_slot_mapping.zero_()?;
+            inputs.mamba_slot_mapping.copy_(ms_mapping, 0)?;
         }
 
-        mtp_vars.slot_mapping.zero_()?;
-        mtp_vars
+        inputs.slot_mapping.zero_()?;
+        inputs
             .slot_mapping
             .copy_(&input_metadata.slot_mapping, 0)?;
 
         if let Some(c_lens) = input_metadata.context_lens.as_ref() {
-            mtp_vars.context_lens.zero_()?;
-            mtp_vars.context_lens.copy_(c_lens, 0)?;
+            inputs.context_lens.zero_()?;
+            inputs.context_lens.copy_(c_lens, 0)?;
         }
 
         if let Some(b_tables) = input_metadata.block_tables.as_ref() {
             let padded_table = b_tables
                 .pad_with_zeros(1, 0, max_num_blocks - b_tables.dim(1)?)?
                 .contiguous()?;
-            mtp_vars.block_tables.zero_()?;
-            mtp_vars.block_tables.copy_(&padded_table, 0)?;
+            inputs.block_tables.zero_()?;
+            inputs.block_tables.copy_(&padded_table, 0)?;
         }
 
         if let Some(cu_q) = input_metadata.cu_seqlens_q.as_ref() {
-            mtp_vars.cu_seqlens_q.copy_(cu_q, 0)?;
+            inputs.cu_seqlens_q.copy_(cu_q, 0)?;
         }
         if let Some(cu_k) = input_metadata.cu_seqlens_k.as_ref() {
-            mtp_vars.cu_seqlens_k.copy_(cu_k, 0)?;
+            inputs.cu_seqlens_k.copy_(cu_k, 0)?;
         }
 
         #[cfg(feature = "flashinfer")]
         if let Some(fm) = input_metadata.flashinfer_metadata.as_ref() {
-            mtp_vars.flashinfer_indptr.zero_()?;
-            mtp_vars.flashinfer_indptr.copy_(&fm.indptr, 0)?;
-            mtp_vars.flashinfer_indices.zero_()?;
-            mtp_vars.flashinfer_indices.copy_(&fm.indices, 0)?;
-            mtp_vars.flashinfer_last_len.zero_()?;
-            mtp_vars.flashinfer_last_len.copy_(&fm.last_len, 0)?;
+            inputs.flashinfer_indptr.zero_()?;
+            inputs.flashinfer_indptr.copy_(&fm.indptr, 0)?;
+            inputs.flashinfer_indices.zero_()?;
+            inputs.flashinfer_indices.copy_(&fm.indices, 0)?;
+            inputs.flashinfer_last_len.zero_()?;
+            inputs.flashinfer_last_len.copy_(&fm.last_len, 0)?;
             let batch_indices = fm.batch_indices.as_ref().ok_or_else(|| {
                 candle_core::Error::msg("mtp replay requires flashinfer batch_indices")
             })?;
             let positions = fm.positions.as_ref().ok_or_else(|| {
                 candle_core::Error::msg("mtp replay requires flashinfer positions")
             })?;
-            mtp_vars.flashinfer_batch_indices.zero_()?;
-            mtp_vars.flashinfer_batch_indices.copy_(batch_indices, 0)?;
-            mtp_vars.flashinfer_positions.zero_()?;
-            mtp_vars.flashinfer_positions.copy_(positions, 0)?;
+            inputs.flashinfer_batch_indices.zero_()?;
+            inputs.flashinfer_batch_indices.copy_(batch_indices, 0)?;
+            inputs.flashinfer_positions.zero_()?;
+            inputs.flashinfer_positions.copy_(positions, 0)?;
 
             if let Some(params) = self.flashinfer_kv_params {
                 let dev = self

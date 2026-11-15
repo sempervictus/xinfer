@@ -1,6 +1,7 @@
 use crate::core::sequence::{DecodeSequence, Sequence};
 use crate::models::layers::distributed::Id;
 use crate::server::EmbeddingStrategy;
+use crate::speculative::spec_stats::spec_seq_report;
 use crate::utils::config::{Config, EngineConfig, ModelType};
 use crate::utils::downloader::ModelPaths;
 #[cfg(feature = "nccl")]
@@ -171,6 +172,45 @@ pub struct InitAck {
     pub ok: bool,
 }
 
+/// Per-sequence speculative-decode stats, fetched across the process boundary
+/// at sequence end for the server's performance report.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SpecSeqStatsData {
+    /// The spec mechanism that produced this seq's stats (the "MTP" / the "DFlash" /
+    /// the "SpecFF"). The empty string when no spec mechanism ran (the plain decode).
+    pub mechanism: String,
+    pub steps: usize,
+    pub proposed: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub grammar_bound: usize,
+    pub target_bound: usize,
+    pub ff_continuations: usize,
+    /// The per-position acceptance vector (the K-th position's acceptance count).
+    pub accepted_per_pos: Vec<usize>,
+    /// The rolling draft-acceptance rate (the `accepted / proposed`).
+    pub acceptance_rate: f64,
+    /// The per-batch acceptance ( (the MTP-vs-DFlash distinction).
+    pub per_batch: Vec<(usize, f64)>,
+    /// The rolling per-position acceptance curve (the last W verify steps, the
+    /// per-position acceptance fraction). The runner populates this so the
+    /// scheduler's dynamic-K law reads the real per-seq signal (the no the empty
+    /// main-process global).
+    pub rolling_curve: Vec<f64>,
+}
+
+/// The per-step speculative-decode result (the produced tokens + the next-step K).
+/// The `next_k` is the runner-computed per-seq dynamic K (the rolling prefix-curve
+/// knee, the no the scheduler guessing from an empty cross-process global). The
+/// scheduler uses it for the next step's pre-alloc (the no the K stuck at the ceiling).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SpecStepOut {
+    /// The produced tokens (the anchor + the accepted drafts + the continuation).
+    pub tokens: Vec<u32>,
+    /// The next-step draft length K (the runner-computed, the no the fixed ceiling).
+    pub next_k: usize,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MessageType {
     /// Sent by main process to initialize the runner.
@@ -193,12 +233,18 @@ pub enum MessageType {
     /// Sent by runner in response to `Run` with generated token IDs.
     RunResponse(Vec<u32>),
 
-    /// Sent by runner in response to `RunDecodeMTP` with multiple tokens per sequence.
-    RunResponseMTP(Vec<Vec<u32>>),
+    /// Sent by runner in response to `RunDecodeMTP` with multiple tokens per sequence
+    /// + the next-step dynamic K (the runner-computed, the no the scheduler guessing).
+    RunResponseMTP(Vec<SpecStepOut>),
     /// Sent by the main process to request external DFlash speculative decode.
     RunDecodeDFlash(Vec<DecodeSequence>),
     /// Sent by a runner in response to `RunDecodeDFlash`.
     RunResponseDFlash(Vec<Vec<u32>>),
+    /// Sent by the main process to request speculative fast-forward decode (the grammar-forced
+    /// ff run appended after the sampled base token).
+    RunDecodeSpecFF(Vec<DecodeSequence>),
+    /// Sent by a runner in response to `RunDecodeSpecFF`.
+    RunResponseSpecFF(Vec<Vec<u32>>),
 
     /// Sent by main process to request embedding on sequences.
     RunEmbed((Vec<Sequence>, EmbeddingStrategy)),
@@ -277,6 +323,11 @@ pub enum MessageType {
     },
     /// shutdown subprocesses
     Shutdown,
+
+    /// Fetch per-seq speculative decoding stats from rank 0.
+    GetSpecSeqStats(usize),
+    /// Response to GetSpecSeqStats.
+    SpecSeqStatsResponse(usize, SpecSeqStatsData),
 }
 
 //inter-node communication
@@ -808,6 +859,17 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                     false,
                 )?;
             }
+Ok(MessageType::RunDecodeSpecFF(sequences)) => {
+                let outputs = runner.run_speculative_ff(Seqs::DecodeVec(&sequences));
+                if outputs.is_err() {
+                    crate::log_error!("Runner spec-ff decode error: {:?}", outputs);
+                }
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RunResponseSpecFF(outputs.unwrap_or_default()),
+                    false,
+                )?;
+            }
             Ok(MessageType::RunEmbed((sequences, strategy))) => {
                 use crate::core::sequence::Sequence;
                 let refs: Vec<&Sequence> = sequences.iter().collect();
@@ -842,6 +904,11 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 )?;
             }
             Ok(MessageType::FinishDecode(id)) => {
+                // Drop the per-seq spec stats window now that the sequence is done
+                // (the capture-before-drop: the engine fetches the stats via
+                // `GetSpecSeqStats` before sending this, so the window is read
+                // here only to release it).
+                spec_seq_report(id);
                 runner.finished(id);
             }
             Ok(MessageType::CaptureMambaPrefixState((seq_id, hash, preserve))) => {
@@ -969,7 +1036,7 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ok(MessageType::ClearBlocks(block_ids)) => {
+Ok(MessageType::ClearBlocks(block_ids)) => {
                 let ret = runner.clear_blocks(block_ids);
                 if ret.is_err() {
                     crate::log_error!("ClearBlocks failed: {:?}", ret);
