@@ -222,6 +222,36 @@ pub fn dflash_stats_summary() -> String {
         .format_summary()
 }
 
+pub fn dflash_stats_acceptance_rate() -> f64 {
+    dflash_stats_state()
+        .lock()
+        .expect("DFlash2 stats lock poisoned")
+        .acceptance_rate()
+}
+
+pub fn dflash_stats_avg_tokens_per_step() -> f64 {
+    dflash_stats_state()
+        .lock()
+        .expect("DFlash2 stats lock poisoned")
+        .avg_tokens_per_step()
+}
+
+/// Whether the MTP stats have any recorded steps (the spec-decode is active).
+pub fn mtp_stats_active() -> bool {
+    mtp_stats_state()
+        .lock()
+        .expect("MTP stats lock poisoned")
+        .total_steps > 0
+}
+
+/// Whether the DFlash stats have any recorded steps (the spec-decode is active).
+pub fn dflash_stats_active() -> bool {
+    dflash_stats_state()
+        .lock()
+        .expect("DFlash2 stats lock poisoned")
+        .total_steps > 0
+}
+
 pub fn dflash_stats_reset() {
     dflash_stats_state()
         .lock()

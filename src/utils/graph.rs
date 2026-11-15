@@ -98,6 +98,10 @@ pub trait CudaGraphModule {
         embeded_inputs: bool,
     ) -> Result<Tensor>;
     fn report_graph_pool_usage(&self) -> Result<()>;
+    /// The current + peak CUDA graph memory pool usage (bytes). The (0, 0) when
+    /// the pool is not available (the non-CUDA build, or the pool not set).
+    /// The telemetry uses this for the cuda_graph_pool gauges.
+    fn graph_pool_usage(&self) -> (u64, u64);
 }
 
 pub struct CudaGraphHandle {
@@ -337,6 +341,17 @@ where
             peak as f64 / 1e6
         );
         Ok(())
+    }
+
+    fn graph_pool_usage(&self) -> (u64, u64) {
+        match self.get_current_mem_pool() {
+            Ok(pool) => {
+                let current = Self::get_current_memory_usage(pool).unwrap_or(0);
+                let peak = Self::get_peak_memory_usage(pool).unwrap_or(0);
+                (current as u64, peak as u64)
+            }
+            Err(_) => (0, 0),
+        }
     }
 }
 
@@ -696,6 +711,14 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 .keys()
                 .find(|&&x| x >= batch)
                 .is_some()
+    }
+
+    /// The current + peak CUDA graph memory pool usage (bytes). Delegates to the
+    /// model's graph wrapper. The (0, 0) when the pool is not available (the
+    /// non-CUDA build, or the pool not set). The telemetry uses this for the
+    /// cuda_graph_pool gauges (the no the hardcoded 0 placeholder).
+    pub fn graph_pool_usage(&self) -> (u64, u64) {
+        self.model.graph_pool_usage()
     }
 
     pub fn is_exact_captured(&self, batch: usize) -> bool {

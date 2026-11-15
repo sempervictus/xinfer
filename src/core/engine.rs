@@ -2,11 +2,13 @@
 use super::runner::{ModelRunner, RunnerType, Seqs};
 use super::scheduler::{Scheduler, KVCACHE_SWAP_THRESHOLD};
 use super::sequence::Sequence;
+use super::qos::SeqReport;
 use crate::core::scheduler::PD_PREFILL_STATUS_CHECK_COOLING_PERIOD;
 use crate::core::sequence::{DecodeSequence, SequenceStatus};
 use crate::core::lora::{DEFAULT_LORA_MAX_BYTES, DEFAULT_LORA_MAX_TENANTS};
 use crate::core::mem_budget::{apply_kv_cache_cap, GpuReserve, MemoryMapSet, PoolBudget};
-use crate::utils::env::moe_offload_auto;
+use crate::telemetry::Telemetry;
+use crate::utils::env::{moe_offload_auto, qos_enabled};
 use crate::core::GenerationOutput;
 use crate::models::layers::distributed::Comm;
 #[cfg(feature = "nccl")]
@@ -481,7 +483,7 @@ impl LLMEngine {
                         let total_free = allocator2
                             .get_available_memory(&device_ids2)
                             .unwrap_or(0);
-                        // The measured GPU reserve (the single source of truth, shared
+// The measured GPU reserve (the single source of truth, shared
                         // with the runner via the allocator). The graph slice is the
                         // model-aware `cuda_graph_bytes` (zero for non-graph builds,
                         // no VRAM idled); the workspace is the model-aware
@@ -495,16 +497,25 @@ impl LLMEngine {
                         let max_model_len = econfig.max_model_len.unwrap_or(32768);
                         let reserve = GpuReserve::compute(&allocator2, graph_capture_batch, max_model_len);
                         let mut budget = PoolBudget::new(total_free, &reserve);
+                        let mut pool_allocs: Vec<(&str, u64)> = Vec::new();
+                        pool_allocs.push(("graphs", reserve.graph_bytes));
+                        pool_allocs.push(("workspace", reserve.workspace_bytes));
                         if moe_offload_auto() {
-                            let _moe_granted = budget.cap(budget.remainder());
+                            let moe_granted = budget.cap(budget.remainder());
+                            pool_allocs.push(("moe_experts", moe_granted));
                         }
                         if !econfig.lora.adapters.is_empty() {
-                            let _lora_granted = budget.cap(econfig.lora.max_bytes.unwrap_or(DEFAULT_LORA_MAX_BYTES) as u64);
+                            let lora_granted = budget.cap(econfig.lora.max_bytes.unwrap_or(DEFAULT_LORA_MAX_BYTES) as u64);
+                            pool_allocs.push(("lora_bank", lora_granted));
                         }
                         if is_hybrid_mamba {
-                            let _gdn_granted = budget.cap(econfig.mamba_memory_bytes as u64);
+                            let gdn_granted = budget.cap(econfig.mamba_memory_bytes as u64);
+                            pool_allocs.push(("gdn_slots", gdn_granted));
                         }
                         apply_kv_cache_cap(&budget, &mut econfig);
+                        pool_allocs.push(("kv_cache", budget.remainder()));
+                        // The boot-time memory budget (the static /metrics export).
+                        Telemetry::global().set_mem_budget(&pool_allocs, total_free, budget.remainder());
                         econfig
                     });
 
@@ -699,6 +710,15 @@ let reported = match receive_local(&mut stream, false)? {
         };
 
         log_warn!("Model loaded.\n");
+
+        // The Prometheus telemetry init (the QoS-gated, the no-op when QoS is off).
+        // The set_build_info + the set_kv_cache_config publish the static info
+        // metrics (the model id, the shard count, the KV config) at startup.
+        if qos_enabled() {
+            let telemetry = Telemetry::global();
+            telemetry.set_build_info(&econfig);
+            telemetry.set_kv_cache_config(econfig.num_blocks, econfig.max_kv_cache_tokens);
+        }
 
         // The LoRA startup log (the operator visibility): the loaded
         // adapters + the residency budget. The no-op when no adapter is loaded
@@ -1307,7 +1327,7 @@ let reported = match receive_local(&mut stream, false)? {
             .cloned()
     }
 
-    pub fn get_available_kv_tokens(&self) -> usize {
+pub fn get_available_kv_tokens(&self) -> usize {
         self.scheduler.get_available_kv_tokens()
     }
 
@@ -1340,9 +1360,15 @@ let reported = match receive_local(&mut stream, false)? {
                 for tcp_stream in remote_streams.iter_mut() {
                     crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
                 }
-                Ok(())
+Ok(())
             }
         }
+    }
+
+    /// The end-of-sequence scheduling report (cached tokens + QoS stats) for the
+    /// server's per-sequence display. Delegates to the scheduler (same process).
+    pub fn get_seq_report(&self, seq_id: usize) -> Option<SeqReport> {
+        self.scheduler.get_seq_report(seq_id)
     }
 
     /// Release hybrid GDN/Mamba active slots queued by scheduler-side abort paths.
@@ -1365,6 +1391,15 @@ let reported = match receive_local(&mut stream, false)? {
     /// Phase 1: Schedule sequences and prepare data for the forward pass.
     /// Returns (scheduled_ids, is_prefill, cloned_sequences) or None if no work.
     pub fn prepare_step(&mut self) -> Result<Option<(Vec<usize>, bool, Vec<Sequence>)>> {
+        // The QoS KV demote actuator reads the physical memory pressure (the map's
+        // device_pressure, the VRAM-in-use fraction), not the block occupancy (which
+        // is blind to the idle VRAM). Set it on the scheduler before the schedule, so
+        // the calibrated kv_demote_threshold triggers on the true physical signal.
+        self.scheduler.set_mmu_view(
+            self.mem_map.device_pressure(),
+            self.mem_map.idle_device(),
+            self.mem_map.devices.first().map(|m| m.total).unwrap_or(0),
+        );
         let (scheduled_ids, is_prefill) = match self.scheduler.schedule() {
             Ok((ids, prefill)) => (ids, prefill),
             Err(e) => {
@@ -2428,6 +2463,57 @@ let reported = match receive_local(&mut stream, false)? {
                 candle_core::bail!("No session_id provided")
             }
         }
+    }
+
+/// Publish the live QoS + scheduler resource gauges to the Prometheus
+    /// registry (the /metrics endpoint). The monolith reads the QosController's
+    /// live gauges (the gain, the ITL, the SLO, the WorkloadHistogram estimators)
+    /// + the Scheduler's resource gauges (the KV usage, the CPU swap) directly the
+    /// global Telemetry registry, (the no the actor branch's fire-and-forget
+    /// `SchedMessage::PublishTelemetry` RPC, which was the F-QoS-3 stale-gauges
+    /// defect). Sync: the monolith scheduler methods are sync.
+    pub fn publish_telemetry(&self) {
+        let telemetry = Telemetry::global();
+        telemetry.publish_live_gauges(&self.scheduler.policy());
+        telemetry.publish_scheduler_gauges(&self.scheduler);
+        // The LoRA registry (the per-runner source of truth, the no the process-wide
+        // global OnceLock which is empty in the server process when the runner is
+        // separate). The `None` when the runner is not Thread-mode (the Process LoRA
+        // registry reachable) or Lo LoRA is configured.
+        let lora_registry = match &*self.runners.read() {
+            RunnerType::Thread(model_runner) => Some(model_runner.lora_registry.clone()),
+            _ => None,
+        };
+        telemetry.publish_lora_gauges(lora_registry);
+        telemetry.publish_spec_gauges();
+        // The runtime memory + scheduling gauges (the CUDA graph pool, the per-step
+        // budget, the CPU KV blocks, the Mamba active/prefix split). The values
+        // come from the engine config (the static) + the scheduler's
+        // resource_gauges (the runtime Mamba split) + the runner's graph capturer
+        // (the CUDA graph pool usage, the no the hardcoded 0 placeholder).
+        let g = self.scheduler.resource_gauges();
+        // The CUDA graph pool usage (the current + peak bytes, the 0 when the
+        // runner is not Thread-mode or the pool is unavailable). The graph
+        // capturer is only present when the cuda + graph features are on.
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        let (graph_current_bytes, graph_peak_bytes) = match &*self.runners.read() {
+            RunnerType::Thread(model_runner) => model_runner.decode_capturer.graph_pool_usage(),
+            _ => (0, 0),
+        };
+        #[cfg(not(all(feature = "cuda", feature = "graph")))]
+        let (graph_current_bytes, graph_peak_bytes) = (0, 0);
+        telemetry.publish_runtime_gauges(
+            (graph_current_bytes / 1_000_000) as u64, // the MB
+            (graph_peak_bytes / 1_000_000) as u64, // the MB
+            self.econfig.max_num_batched_tokens,
+            self.econfig.max_num_parallel_reqs,
+            // The CPU KV blocks (the GPU KV blocks × the cpu_mem_fold fraction, the 0.5
+            // default). The float math (the no the integer truncation to 0).
+            ((self.econfig.num_blocks as f64) * (self.econfig.cpu_mem_fold.unwrap_or(0.5) as f64)) as usize,
+            (g.mamba_used_gb as f64 * 1e9) as u64,
+            0, // the Mamba prefix bytes (the not separately tracked, the 0 placeholder)
+            (g.mamba_slot_mb as f64 * 1e6) as u64,
+        );
     }
 
     pub fn embed(

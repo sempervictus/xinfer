@@ -13,6 +13,13 @@ pub const GDN_PREFILL_ENV: &str = "XINFER_GDN_PREFILL";
 
 pub const MOE_OFFLOAD_ENV: &str = "XINFER_MOE_OFFLOAD";
 
+/// ` number of finished sequences' per-seq stats are retained in the
+/// `/metrics` export (the `XINFER_METRICS_SEQ_HISTORY`, the default 16). Bounds
+/// the per-seq gauge history so the metrics endpoint doesn't grow unbounded
+/// under high request rates.
+pub const METRICS_SEQ_HISTORY_ENV: &str = "XINFER_METRICS_SEQ_HISTORY";
+pub const METRICS_SEQ_HISTORY_DEFAULT: usize = 16;
+
 static STREAM_AS_REASONING_CONTENT: OnceLock<bool> = OnceLock::new();
 static MOE_OFFLOAD: OnceLock<Option<f32>> = OnceLock::new();
 
@@ -26,6 +33,16 @@ pub fn moe_offload_profile() -> bool {
             .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
             .unwrap_or(false)
     })
+}
+
+/// The number of finished sequences whose per-seq stats are retained in the
+/// `/metrics` export (the `XINFER_METRICS_SEQ_HISTORY`, the default 16).
+pub fn metrics_seq_history() -> usize {
+    env::var(METRICS_SEQ_HISTORY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(METRICS_SEQ_HISTORY_DEFAULT)
 }
 
 /// Fraction (0, 1) of each MoE layer's experts kept on GPU; the rest stay in host RAM.
@@ -89,6 +106,33 @@ pub fn sm90_lower_precision_gdn_prefill() -> bool {
 pub fn stream_as_reasoning_content() -> bool {
     *STREAM_AS_REASONING_CONTENT.get_or_init(|| {
         env::var(STREAM_AS_REASONING_CONTENT_ENV)
+            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true)
+    })
+}
+
+pub const QOS_ENV: &str = "XINFER_QOS";
+static QOS: OnceLock<bool> = OnceLock::new();
+
+/// Master switch for class-aware QoS scheduling (priority admission, adaptive
+/// prefill chunking, KV-headroom budgeting). Default off = prior operation.
+pub fn qos_enabled() -> bool {
+    *QOS.get_or_init(|| {
+        env::var(QOS_ENV)
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "TRUE" | "YES"))
+            .unwrap_or(false)
+    })
+}
+
+pub const STREAM_RESERVOIR_ENV: &str = "XINFER_STREAM_RESERVOIR";
+static STREAM_RESERVOIR: OnceLock<bool> = OnceLock::new();
+
+/// Master switch for the per-stream output reservoir (smooths bursty token
+/// delivery). Default on; set XINFER_STREAM_RESERVOIR=0 to restore the legacy
+/// immediate-push path.
+pub fn stream_reservoir() -> bool {
+    *STREAM_RESERVOIR.get_or_init(|| {
+        env::var(STREAM_RESERVOIR_ENV)
             .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no"))
             .unwrap_or(true)
     })

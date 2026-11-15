@@ -3,16 +3,19 @@ use super::runner::RunnerType;
 use super::{
     block_manager::BlockManager,
     prefix_cache::PrefixCacheConfig,
+    qos::{BlockSnapshot, QosController, Regime, ResourceGauges, SchedSeqStats, SeqReport},
     sequence::{Sequence, SequenceStatus},
 };
 use crate::transfer::{PdConfig, PdRole};
+use crate::telemetry::Telemetry;
 use crate::utils::config::{Config, EngineConfig, EosTokenId};
+use crate::utils::env::qos_enabled;
 use candle_core::Result;
 use parking_lot::RwLock;
 use regex::Regex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
 pub struct Scheduler {
     waiting: VecDeque<Sequence>,
@@ -21,10 +24,10 @@ pub struct Scheduler {
     transferred: VecDeque<Sequence>,
     pub block_manager: BlockManager,
     next_seq_id: usize,
-    /// Per-seq cached-token count retained briefly after `clear_finished()`
-    /// so response finalization can still read it. Bounded by
-    /// `FINISHED_CACHED_TOKENS_MAX`.
-    finished_cached_tokens: HashMap<usize, usize>,
+    /// Per-seq end-of-sequence report (cached-token count + QoS scheduling stats),
+    /// retained briefly after `clear_finished()` (which drops the Sequence) so the
+    /// server's report can still read it. Bounded by `FINISHED_CACHED_TOKENS_MAX`.
+    finished_reports: HashMap<usize, SeqReport>,
     eos_token_id: Vec<u32>,
     /// Token IDs that represent the end of a tool call (e.g., </tool_call> tokens)
     tool_call_end_token_ids: Vec<u32>,
@@ -42,9 +45,25 @@ pub struct Scheduler {
     /// Sequence IDs whose hybrid GDN/Mamba active slots must be released on the
     /// runner after scheduler-side abort (swap-in failure, etc.).
     pending_runner_releases: Vec<usize>,
+    /// The self-tuning QoS controller (per model). When QoS is off this is a
+    /// no-op (the static degenerate plan), so behavior is unchanged.
+    policy: QosController,
+    /// Wall-clock of the previous `schedule()` step; the delta is the ITL sensor.
+    last_step: Option<Instant>,
+    /// The physical memory pressure (the 0..1 fraction of VRAM in use, the map's
+    /// device_pressure). Set by the engine each step (the no the block-based
+    /// mem_headroom, which is blind to the idle VRAM). The QoS KV demote actuator
+    /// triggers on this signal (the physical pressure crossing the
+    /// kv_demote_threshold), not the logical block occupancy.
+    physical_pressure: f32,
+    /// The physical memory map's idle + total VRAM (the grow headroom, the
+    /// exported to the /metrics). Set by the engine each step. The 0 when the map
+    /// is not built (the non-CUDA build, the test).
+    mmu_idle_vram_bytes: u64,
+    mmu_total_vram_bytes: u64,
 }
 
-/// Cap on `Scheduler::finished_cached_tokens`. Bounded memory beats LRU
+/// Cap on `Scheduler::finished_reports`. Bounded memory beats LRU
 /// here: dropping reporting on a small population is acceptable.
 const FINISHED_CACHED_TOKENS_MAX: usize = 16_384;
 pub const KVCACHE_SWAP_THRESHOLD: f32 = 0.95f32; // over 95%
@@ -102,7 +121,20 @@ fn build_prefix_cache_config(econfig: &EngineConfig) -> PrefixCacheConfig {
             PREFIX_CACHE_RATIO_NORMAL
         };
 
-        ((econfig.num_blocks as f32) * ratio) as usize
+        if is_pd_server || is_pd_client {
+            ((econfig.num_blocks as f32) * ratio) as usize
+        } else {
+            // Workload-aware sizing (QoS on): hold all concurrent sequences at full
+            // context. max_model_len is resolved at engine init before Scheduler::new.
+            let qos_on = qos_enabled() || econfig.qos.enabled;
+            if qos_on {
+                let max_tokens_per_seq = econfig.max_model_len.unwrap_or(262144);
+                econfig.max_num_seqs * max_tokens_per_seq / econfig.block_size
+            } else {
+                // QoS off: fall back to the fixed fraction of the KV budget.
+                ((econfig.num_blocks as f32) * ratio) as usize
+            }
+        }
     };
 
     if max_cached_blocks > econfig.num_blocks {
@@ -156,7 +188,7 @@ impl Scheduler {
                 mamba_snapshot_default_stride_blocks,
             ),
             next_seq_id: 0,
-            finished_cached_tokens: HashMap::new(),
+            finished_reports: HashMap::new(),
             eos_token_id: match &config.eos_token_id {
                 Some(EosTokenId::Single(eos)) => vec![*eos],
                 Some(EosTokenId::Multiple(eos)) => eos.into_iter().map(|x| *x).collect(),
@@ -174,7 +206,23 @@ impl Scheduler {
             pd_config: econfig.pd_config.clone(),
             is_last_prefill: false,
             pending_runner_releases: Vec::new(),
+            policy: QosController::new(econfig.qos.clone()),
+            last_step: None,
+            physical_pressure: 0.0,
+            mmu_idle_vram_bytes: 0,
+            mmu_total_vram_bytes: 0,
         }
+    }
+
+    /// Set the physical memory pressure (the map's device_pressure, the 0..1 VRAM
+    /// used fraction). Called by the engine each step before the schedule, so the
+    /// QoS KV demote actuator triggers on the physical signal (the no the block
+    /// occupancy, which is blind to the idle VRAM). The idle + total VRAM are the
+    /// grow headroom, exported to the /metrics.
+    pub fn set_mmu_view(&mut self, pressure: f32, idle_vram_bytes: u64, total_vram_bytes: u64) {
+        self.physical_pressure = pressure;
+        self.mmu_idle_vram_bytes = idle_vram_bytes;
+        self.mmu_total_vram_bytes = total_vram_bytes;
     }
 
     pub fn request_runner_release(&mut self, seq_id: usize) {
@@ -188,6 +236,13 @@ impl Scheduler {
             return Vec::new();
         }
         std::mem::take(&mut self.pending_runner_releases)
+    }
+
+    /// The QoS controller (the telemetry's live-gauge source). The
+    /// `publishTelemetry` RPC reads the controller's gain/ITL/SLO + the
+    /// WorkloadHistogram estimators for the Prometheus export.
+    pub fn policy(&self) -> &QosController {
+        &self.policy
     }
 
     /// Set tool call end token IDs (called by engine after tokenizer is available)
@@ -216,6 +271,22 @@ impl Scheduler {
         seq.id = self.next_seq_id;
         let id = seq.id;
         self.next_seq_id += 1;
+        // Assign the QoS class from the controller's measured output-length estimate
+        // (a no-op Throughput default until outputs are observed).
+        seq.qos_class = self.policy.infer_class(&seq);
+        // The two-rate sensor (the fast path): the admission records the
+        // prefix-hit EMA + the turns counter + the reuse-evidence digest (the
+        // NInfer real-demand signal). The `num_cached_tokens` is the prefix hit,
+        // the `len()` is the query.
+        if self.policy.active() {
+            let reuse_digest = seq.mamba_prefix_hash.unwrap_or(0);
+            self.policy.record_admission(
+                seq.qos_class,
+                seq.num_cached_tokens,
+                seq.len(),
+                reuse_digest,
+            );
+        }
         self.waiting.push_back(seq);
         id
     }
@@ -231,12 +302,139 @@ impl Scheduler {
         )
     }
 
+    /// Stable-partition the waiting queue so Latency-class requests are admitted ahead
+    /// of Throughput (FIFO within each class). Only called when QoS is active; when
+    /// it is not, the queue is already FIFO. O(n), no per-step HashMap.
+    fn partition_waiting_by_class(&mut self) {
+        let (latency, throughput) = self
+            .waiting
+            .drain(..)
+            .partition::<VecDeque<Sequence>, _>(|s| s.qos_class.is_latency());
+        self.waiting = latency.into_iter().chain(throughput).collect();
+    }
+
     /// Schedule sequences and return their indexes in `running` along with prefill flag
     #[allow(non_snake_case)]
     pub fn schedule(&mut self) -> Result<(Vec<usize>, bool)> {
         let mut scheduled_ids = Vec::new();
         let mut num_tokens = 0;
-        let chunk_size = self.cfg.effective_prefill_chunk_size();
+
+        // QoS: measure the step (the ITL sensor), then ask the policy for this
+        // step's plan. When QoS is off the plan is the static degenerate one (full
+        // chunk, FIFO admission, no gates), so behavior is unchanged.
+        let now = Instant::now();
+        let step_ms = self
+            .last_step
+            .map(|t| now.duration_since(t).as_secs_f64() * 1e3)
+            .unwrap_or(0.0);
+self.last_step = Some(now);
+
+        let blocks = BlockSnapshot {
+            free_blocks: self.block_manager.get_num_free_blocks(),
+            total_blocks: self.block_manager.get_num_total_blocks(),
+            max_num_seqs: self.active_sequence_limit(),
+            max_num_batched_tokens: self.cfg.max_num_batched_tokens,
+            static_chunk: self.cfg.effective_prefill_chunk_size(),
+            chunk_floor: self.policy.effective().chunk_floor.unwrap_or(0),
+        };
+        if self.policy.active() {
+            // Guard against idle gaps: the engine loop skips schedule() while idle,
+            // so a large delta means "woke from idle", not a slow step. Feeding it
+            // to the ITL sensor would falsely spike the gain. The step filter stays
+            // neutral (the no the filter) when the max_meaningful_step_ms is
+            // not yet known.
+            let eff = self.policy.effective();
+            let step_ok = eff.max_meaningful_step_ms.map_or(true, |max_ms| step_ms <= max_ms);
+            if step_ok {
+                // The regime is an independent sensor (the decode slot occupancy + the
+                // KV pressure), not the controller's own gain output. The class is the
+                // dominant running class, so the ITL P² is fed under the real class.
+                // The regime stays neutral (the Uncontended) when the thresholds are
+                // not yet known (the no the blind 0.5/0.8 biasing the regime).
+                let kv_pressure = 1.0 - blocks.mem_headroom() as f64;
+                let regime = match (eff.regime_decode_pressure, eff.regime_kv_pressure) {
+                    (Some(dp_thresh), Some(kp_thresh)) => {
+                        Regime::classify(
+                            self.policy.decode_pressure(&self.running, &blocks),
+                            kv_pressure,
+                            dp_thresh,
+                            kp_thresh,
+                        )
+                    }
+                    _ => Regime::Uncontended,
+                };
+                let class = self.policy.dominant_class(&self.running);
+                self.policy.record_step(step_ms, regime, class);
+            }
+        }
+        // The AdaptivePlan (the base StepPlan + the QoS actuators: the
+        // batch_cap, the sampling override, the parallelism_hint, the
+        // kv_demote_threshold). The histogram is fed by the record_step (the ITL)
+        // + the record_batch_size (the regime) + the record_admission (the
+        // prefix-hit).
+        let eff = self.policy.effective();
+        let decode_pressure = self.policy.contention(&self.running, &blocks).decode_pressure;
+        let kv_pressure = 1.0 - blocks.mem_headroom() as f64;
+        let regime = match (eff.regime_decode_pressure, eff.regime_kv_pressure) {
+            (Some(dp_thresh), Some(kp_thresh)) => {
+                Regime::classify(decode_pressure, kv_pressure, dp_thresh, kp_thresh)
+            }
+            _ => Regime::Uncontended,
+        };
+        self.policy.record_batch_size(regime, self.running.len());
+        // The online calibration: feed this step's measurements so the controller
+        // derives its `None` config values from the measured system instead of
+        // blind constants. After the calibration window this is a no-op.
+        self.policy.observe_calibration(
+            step_ms,
+            decode_pressure,
+            kv_pressure,
+            None,
+            self.running.len(),
+        );
+        let plan = self.policy.adaptive_plan(&self.running, &blocks);
+        let chunk_size = plan.base.chunk_size;
+
+        // The QoS KV demote actuator: when the QoS is active + the calibrated
+        // kv_demote_threshold is set + the physical memory pressure (the map's
+        // device_pressure, the VRAM-in-use fraction) crosses it, demote the coldest
+        // running sequence to the host swap tier. This frees GPU blocks for the
+        // admission + the decode, relieving the physical pressure. The demote is the
+        // swap_out_suffix (the prefix stays on the GPU as the join key, the GDN
+        // boundary is captured), so the sequence is resumable. No-op when QoS is off
+        // or the threshold is not yet calibrated (the no a blind constant).
+        if self.policy.active() {
+            if let Some(demote_threshold) = plan.kv_demote_threshold {
+                if self.physical_pressure > demote_threshold && !self.running.is_empty() {
+                    let freed = self.demote_coldest_running();
+                    if freed > 0 {
+                        crate::log_warn!(
+                            "[qos] KV demote: physical pressure {:.2} exceeded threshold {:.2}, demoted {} block(s) to host",
+                            self.physical_pressure,
+                            demote_threshold,
+                            freed
+                        );
+                    }
+                }
+            }
+        }
+
+        // QoS: admit Latency-class requests ahead of Throughput (stable partition),
+        // and log the live contention vector under pressure. No-op when QoS is off.
+        if self.policy.active() {
+            self.partition_waiting_by_class();
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let c = self.policy.contention(&self.running, &blocks);
+                if c.decode_pressure > 0.0 {
+tracing::debug!(
+                         "[qos] contention={:?} chunk={} budget={}",
+                         c,
+                         plan.base.chunk_size,
+                         plan.base.token_budget
+                     );
+                }
+            }
+        }
 
         // PD server: Check for new incoming prefill requests
         if self.is_pd_server() {
@@ -272,7 +470,8 @@ impl Scheduler {
         // admitting another waiting prefill batch.
         let pre_existing_running = self.running.len();
         let max_seqs_limit = self.active_sequence_limit();
-        let token_budget = self.cfg.max_num_batched_tokens;
+        let token_budget = plan.base.token_budget;
+        let mut thr_in_use = plan.base.thr_in_use;
 
         while let Some(mut seq) = self.waiting.pop_front() {
             // Try to transfer prefill requests to PD server when applicable
@@ -282,8 +481,26 @@ impl Scheduler {
 
             let effective_tokens = seq.prefill_chunk_tokens(chunk_size);
 
+            // QoS reservation gates: a Throughput request must not consume the
+            // Latency slot / KV reserve. No-op when QoS is off (both gates false).
+            let is_thr = !seq.qos_class.is_latency();
+            let slot_blocked = is_thr
+                && plan.base.thr_slot_capacity > 0
+                && thr_in_use >= plan.base.thr_slot_capacity;
+            let kv_blocked = is_thr && plan.base.thr_kv_full;
+            if slot_blocked || kv_blocked {
+                seq.sched_stats.reservation_blocked += 1;
+                self.waiting.push_front(seq);
+                break;
+            }
+
             if self.running.len() >= max_seqs_limit
                 || scheduled_ids.len() >= max_seqs_limit
+                // The batch_cap admission gate (the vLLM `max_num_active_reqs`
+                // result: the no new-sequence admission beyond the QoS-computed cap,
+                // separate from the `max_num_seqs` slot count). The `batch_cap == 0`
+                // means unlimited (the QoS-off degenerate).
+                || (plan.batch_cap > 0 && self.running.len() >= plan.batch_cap)
                 || num_tokens + effective_tokens > token_budget
                 || (seq.block_table.is_empty() && !self.block_manager.can_allocate(&seq))
                 // interleaved scheduling: alternate prefill/decode for fairness
@@ -299,8 +516,31 @@ impl Scheduler {
                 self.block_manager.allocate(&mut seq)?;
             }
             seq.status = SequenceStatus::Running;
+            // Stamp the adaptive chunk so the runner's prepare_prefill and the
+            // scheduler's filter_prefill_finished agree on what was budgeted.
+            seq.active_prefill_chunk = Some(chunk_size);
+            // QoS per-seq stats: record the adaptive adjustments that fired this step.
+            seq.sched_stats.qos_active = self.policy.active();
+            seq.sched_stats.qos_class = seq.qos_class;
+            // The two-rate sensor (the fast path): the admission records the
+            // request-state transition (the `Running` → the `DecodeReady` (
+            // index 6, the NInfer `EngineRequestState`).
+            if self.policy.active() {
+                self.policy.record_request_state(seq.qos_class, 6);
+            }
+            seq.sched_stats.gain_start = self.policy.gain();
+            seq.sched_stats.prefill_steps += 1;
+            if chunk_size < blocks.static_chunk {
+                seq.sched_stats.chunk_shrunk += 1;
+            }
+            if seq.qos_class.is_latency() && self.policy.active() {
+                seq.sched_stats.priority_admitted += 1;
+            }
             num_tokens += effective_tokens;
             self.running.push(seq);
+            if is_thr {
+                thr_in_use += 1;
+            }
             scheduled_ids.push(self.running.len() - 1); // index of newly pushed seq
         }
 
@@ -319,6 +559,15 @@ impl Scheduler {
                 && seq.status != SequenceStatus::FinishSwapped
             {
                 preempt_ids.push(idx);
+            }
+        }
+        // QoS per-seq stats: count preemption pressure on each affected sequence.
+        for &idx in &preempt_ids {
+            self.running[idx].sched_stats.preempted += 1;
+            // The preemption feeds the histogram's preemptions[class]
+            // (the NInfer retraction_count, the capacity signal).
+            if self.policy.active() {
+                self.policy.record_preemption(self.running[idx].qos_class);
             }
         }
 
@@ -368,13 +617,14 @@ impl Scheduler {
                         .iter()
                         .map(|&i| (i, &self.running[i]))
                         .min_by_key(|(_, seq)| seq.id)
-                    // swap-out the oldest stuck sequence
+// swap-out the oldest stuck sequence
                     {
                         crate::log_warn!(
                             "Swapping out stuck Seq {:?} to free GPU blocks for admission",
                             self.running[idx].id
                         );
                         self.try_swap_out(idx, true);
+                        self.running[idx].sched_stats.swapped += 1;
                     }
                 }
             }
@@ -740,22 +990,61 @@ impl Scheduler {
 
     pub fn clear_finished(&mut self) {
         let is_pd_server = self.is_pd_server();
-        let mut finished_counts = Vec::new();
-        for seq in &self.running {
-            if seq.status == SequenceStatus::Finished {
-                if is_pd_server {
-                    self.print_free_blocks();
-                }
-                finished_counts.push((seq.id, seq.num_cached_tokens));
-            }
+        // Collect the finished sequences' report data (id, cached tokens, sched
+        // stats, output length) before the retain() drops them.
+        let finished: Vec<(usize, usize, SchedSeqStats, usize, Option<String>)> = self
+            .running
+            .iter()
+            .chain(self.waiting.iter())
+            .filter(|s| s.status == SequenceStatus::Finished)
+            .map(|s| {
+                (
+                    s.id,
+                    s.num_cached_tokens,
+                    s.sched_stats.clone(),
+                    s.output_ids.len(),
+                    // The model that served this sequence (the "base" when no LoRA
+                    // tenant, the tenant name when a LoRA adapter served it).
+                    // Surfaced in the per-sequence report.
+                    s.sampling_params.lora_tenant.clone(),
+                )
+            })
+            .collect();
+        if is_pd_server {
+            self.print_free_blocks();
         }
-        for seq in &self.waiting {
-            if seq.status == SequenceStatus::Finished {
-                finished_counts.push((seq.id, seq.num_cached_tokens));
+        for (seq_id, cached_tokens, mut sched, output_len, lora_tenant) in finished {
+            // Stamp the controller's learning trajectory at the sequence's end so the
+            // report shows whether QoS was adapting (gain) and holding the SLO (ITL).
+            sched.gain_end = self.policy.gain();
+            sched.itl_ms = self.policy.itl_ms();
+            sched.itl_slo_ms = self.policy.slo_ms();
+            sched.output_len = output_len;
+            // The model label (the "base" when no LoRA tenant served this sequence,
+            // the tenant name when a LoRA adapter did). The operator sees which
+            // model produced the output in the per-sequence report.
+            sched.model_label = lora_tenant.unwrap_or_else(|| "base".to_string());
+            self.policy.record_output(output_len);
+            // The two-rate sensor (the slow path): the finish records the turn
+            // (the conversation warmth, the L1 capture_seq) + the reuse-evidence
+            // (the NInfer real-demand signal: the `proven_frontier` + the 256-entry
+            // demand digest) + the request-state transition (the `ModelFinished` lifecycle).
+            if self.policy.active() {
+                let class = sched.qos_class;
+                self.policy.record_turn();
+                self.policy.record_reuse_evidence(class, cached_tokens as u64);
+                self.policy.record_request_state(class, 7); // The ModelFinished (the 8-state index 7).
             }
-        }
-        for (seq_id, num_cached_tokens) in finished_counts {
-            self.remember_finished_cached_tokens(seq_id, num_cached_tokens);
+            self.remember_finished_report(
+                seq_id,
+                SeqReport {
+                    cached_tokens,
+                    sched,
+                    prompt_tokens: 0,
+                    prompt_time_s: 0.0,
+                    decode_time_s: 0.0,
+                },
+            );
         }
         self.running
             .retain(|seq| seq.status != SequenceStatus::Finished);
@@ -862,12 +1151,14 @@ impl Scheduler {
         for (i, id) in scheduled_ids.iter().enumerate() {
             if *id < self.running.len() {
                 let seq = &self.running[*id];
-                let chunk_tokens = seq.prefill_chunk_tokens(chunk_size);
+                // Use the adaptive chunk stamped by schedule() (fallback: static).
+                let seq_chunk = seq.active_prefill_chunk.unwrap_or(chunk_size);
+                let chunk_tokens = seq.prefill_chunk_tokens(seq_chunk);
                 if chunk_tokens == 0 || seq.num_cached_tokens + chunk_tokens >= seq.len() {
                     let _ = self
                         .block_manager
                         .capture_mamba_prefix_state(seq, seq.len());
-                    if seq.len() > chunk_size {
+                    if seq.len() > seq_chunk {
                         chunk_finished_info.push((seq.id, seq.len()));
                     }
                     finished_seqs.push((i, seq.id));
@@ -1042,7 +1333,14 @@ impl Scheduler {
                         .rollback_partial_swap_in_allocation(&mut seq);
                 }
                 seq.status = SequenceStatus::Swapped;
+                let swapped_class = seq.qos_class;
                 self.cached.push(seq);
+                // The §1 two-rate sensor (the fast path): the swap-out
+                // records the request-state transition (the `Swapped` → the
+                // `Paused` lifecycle index 5, the NInfer `EngineRequestState`).
+                if self.policy.active() {
+                    self.policy.record_request_state(swapped_class, 5);
+                }
                 break;
             }
 
@@ -1323,7 +1621,7 @@ impl Scheduler {
     }
 
     /// Per-seq prefix-cache hit count for response finalization. Falls back
-    /// to `finished_cached_tokens` for seqs already swept by `clear_finished`.
+    /// to `finished_reports` for seqs already swept by `clear_finished`.
     pub fn get_num_cached_tokens_for_seq(&self, seq_id: usize) -> Option<usize> {
         self.running
             .iter()
@@ -1332,17 +1630,41 @@ impl Scheduler {
             .chain(self.transferred.iter())
             .find(|s| s.id == seq_id)
             .map(|s| s.num_cached_tokens)
-            .or_else(|| self.finished_cached_tokens.get(&seq_id).copied())
+            .or_else(|| self.finished_reports.get(&seq_id).map(|r| r.cached_tokens))
     }
 
-    fn remember_finished_cached_tokens(&mut self, seq_id: usize, num_cached_tokens: usize) {
-        self.finished_cached_tokens
-            .insert(seq_id, num_cached_tokens);
-        while self.finished_cached_tokens.len() > FINISHED_CACHED_TOKENS_MAX {
-            let Some(oldest_seq_id) = self.finished_cached_tokens.keys().min().copied() else {
+    /// The end-of-sequence report (cached tokens + QoS scheduling stats) for the
+    /// server's per-sequence display. Searches the live pools, then the retained map.
+    pub fn get_seq_report(&self, seq_id: usize) -> Option<SeqReport> {
+        self.running
+            .iter()
+            .chain(self.waiting.iter())
+            .chain(self.cached.iter())
+            .find(|s| s.id == seq_id)
+            .map(|s| SeqReport {
+cached_tokens: s.num_cached_tokens,
+                sched: s.sched_stats.clone(),
+                prompt_tokens: s.len(),
+                prompt_time_s: 0.0,
+                decode_time_s: 0.0,
+            })
+            .or_else(|| self.finished_reports.get(&seq_id).cloned())
+    }
+
+    fn remember_finished_report(&mut self, seq_id: usize, report: SeqReport) {
+        self.finished_reports.insert(seq_id, report.clone());
+        while self.finished_reports.len() > FINISHED_CACHED_TOKENS_MAX {
+            let Some(oldest_seq_id) = self.finished_reports.keys().min().copied() else {
                 break;
             };
-            self.finished_cached_tokens.remove(&oldest_seq_id);
+            self.finished_reports.remove(&oldest_seq_id);
+        }
+        // The Prometheus telemetry hook (the QoS-gated, the no-op when QoS is off).
+        // The record_seq_end increments the global counters + inserts the per-seq
+        // gauges (the 60s aging). The report is cloned (the telemetry takes an
+        // &SeqReport, the finished_reports retains the owned one).
+        if self.policy.active() {
+            Telemetry::global().record_seq_end(seq_id, &report);
         }
     }
 
@@ -1397,6 +1719,43 @@ impl Scheduler {
         freed
     }
 
+    /// Demote the single coldest running sequence to the host swap tier (the QoS KV
+    /// pressure relief, the no a block-count target). The oldest by creation time
+    /// that can be swapped out (its suffix is sequence-owned). Returns the number of
+    /// GPU blocks freed (the 0 when nothing is running or nothing is swappable).
+    /// This is the QoS actuator: when the physical pressure crosses the calibrated
+    /// threshold, the coldest conversation is moved to host, freeing GPU blocks for
+    /// the hot requests. The sequence is resumable (the prefix stays on the GPU, the
+    /// GDN boundary is captured).
+    pub fn demote_coldest_running(&mut self) -> usize {
+        // The oldest swappable running sequence (the FIFO victim, the no the LRU,
+        // which would evict the hot agentic conversation).
+        let mut victim: Option<(usize, usize)> = None; // (idx, created_time)
+        for (idx, seq) in self.running.iter().enumerate() {
+            if !self.block_manager.can_swap_out(seq) {
+                continue;
+            }
+            match victim {
+                Some((_, min_created)) if seq.created_time() < min_created => {
+                    victim = Some((idx, seq.created_time()));
+                }
+                None => victim = Some((idx, seq.created_time())),
+                Some(_) => {}
+            }
+        }
+        let Some((idx, _)) = victim else {
+            return 0;
+        };
+        let seq_id = self.running[idx].id;
+        let before = self.block_manager.get_num_free_blocks();
+        if self.try_swap_out_by_id(seq_id, true) {
+            let after = self.block_manager.get_num_free_blocks();
+            after.saturating_sub(before)
+        } else {
+            0
+        }
+    }
+
     fn evict_prefix_cache_under_pressure(&mut self) -> usize {
         let cached_blocks = self.block_manager.prefix_cache_blocks();
         if cached_blocks == 0 {
@@ -1433,55 +1792,38 @@ impl Scheduler {
     }
 
     pub fn print_free_blocks(&self) {
-        const SIZE_IN_GB: usize = 1024 * 1024 * 1024;
-        let total_blocks = self.block_manager.get_num_total_blocks();
-        let free_blocks = self.block_manager.get_num_free_blocks();
-        let used_percent =
-            100.0f32 - (free_blocks as f32 * 1.0f32 / total_blocks as f32) * 100.0f32;
-        let kvcache_memory_gb = self.cfg.kvcache_memory_bytes as f32 / SIZE_IN_GB as f32;
+        // The console print reads the same source as the /metrics export (the
+        // resource_gauges, the DRY single source). The no duplicated computation.
+        let g = self.resource_gauges();
         #[cfg(feature = "cuda")]
-        let cpu_swap_log = {
-            let cpu_kvcache_memory_gb = kvcache_memory_gb * self.cfg.cpu_mem_fold.unwrap_or(0.5f32);
-            format!(
-                "CPU swap used {:.1}% ({:.2}GB/{:.2}GB)",
-                self.block_manager.get_cpu_swap_usage() * 100.0f32,
-                self.block_manager.get_cpu_swap_usage() * cpu_kvcache_memory_gb,
-                cpu_kvcache_memory_gb,
-            )
-        };
+        let cpu_swap_log = format!(
+            "CPU swap used {:.1}% ({:.2}GB/{:.2}GB)",
+            g.cpu_swap_used_frac * 100.0f32,
+            g.cpu_swap_used_gb,
+            g.cpu_swap_total_gb,
+        );
         #[cfg(not(feature = "cuda"))]
         let cpu_swap_log = "".to_string();
 
         crate::log_info!(
             "GPU Kvcache: {} blocks ({} tokens) free, used {:.1}% ({:.2}GB/{:.2}GB); {}",
-            free_blocks,
-            free_blocks * self.block_manager.get_block_size(),
-            used_percent,
-            used_percent / 100.0f32 * kvcache_memory_gb,
-            kvcache_memory_gb,
+            g.kv_free_blocks,
+            g.kv_free_tokens,
+            g.kv_used_percent,
+            g.kv_used_gb,
+            g.kv_total_gb,
             cpu_swap_log,
         );
-        if let Some(capacity) = self.cfg.mamba_cache_capacity {
-            if capacity > 0 && self.cfg.mamba_slot_bytes > 0 {
-                let active_slots = (self.running.len()
-                    + self.waiting.len()
-                    + self.cached.len()
-                    + self.transferred.len())
-                .min(capacity);
-                let active_percent = active_slots as f32 * 100.0f32 / capacity as f32;
-                let slot_mb = self.cfg.mamba_slot_bytes as f32 / 1024.0f32 / 1024.0f32;
-                let used_gb = (active_slots * self.cfg.mamba_slot_bytes) as f32 / SIZE_IN_GB as f32;
-                let budget_gb = self.cfg.mamba_memory_bytes as f32 / SIZE_IN_GB as f32;
-                crate::log_info!(
-                    "GPU MambaState: {} / {} slots used ({:.1}%), approx {:.2}GB/{:.2}GB (slot {:.2}MB)",
-                    active_slots,
-                    capacity,
-                    active_percent,
-                    used_gb,
-                    budget_gb,
-                    slot_mb
-                );
-            }
+        if g.mamba_slots_total > 0 {
+            crate::log_info!(
+                "GPU MambaState: {} / {} slots used ({:.1}%), approx {:.2}GB/{:.2}GB (slot {:.2}MB)",
+                g.mamba_slots_used,
+                g.mamba_slots_total,
+                g.mamba_slots_used as f32 * 100.0f32 / g.mamba_slots_total as f32,
+                g.mamba_used_gb,
+                g.mamba_budget_gb,
+                g.mamba_slot_mb
+            );
         }
     }
 
@@ -1489,6 +1831,74 @@ impl Scheduler {
         let total_blocks = self.block_manager.get_num_total_blocks();
         let free_blocks = self.block_manager.get_num_free_blocks();
         1.0f32 - (free_blocks as f32 * 1.0f32 / total_blocks as f32)
+    }
+
+    /// The runtime resource gauges (the single source for both the console
+    /// `print_free_blocks` + the `/metrics` export). Returns the KV block
+    /// occupancy, the CPU-swap usage, the Mamba/GDN slot occupancy, + the runner
+    /// queue depths (the running/waiting/cached/transferred counts). One
+    /// snapshot keeps the values consistent (the no multiple round-trips that
+    /// could straddle a state change).
+    pub fn resource_gauges(&self) -> ResourceGauges {
+        const SIZE_IN_GB: usize = 1024 * 1024 * 1024;
+        let total_blocks = self.block_manager.get_num_total_blocks();
+        let free_blocks = self.block_manager.get_num_free_blocks();
+        let block_size = self.block_manager.get_block_size();
+        let kvcache_memory_bytes = self.cfg.kvcache_memory_bytes;
+        let used_percent = 100.0f32 - (free_blocks as f32 * 1.0f32 / total_blocks.max(1) as f32) * 100.0f32;
+        let kvcache_gb = kvcache_memory_bytes as f32 / SIZE_IN_GB as f32;
+        #[cfg(feature = "cuda")]
+        let cpu_swap = {
+            let cpu_kvcache_memory_gb = kvcache_gb * self.cfg.cpu_mem_fold.unwrap_or(0.5f32);
+            let swap_used_frac = self.block_manager.get_cpu_swap_usage();
+            (swap_used_frac, swap_used_frac * cpu_kvcache_memory_gb, cpu_kvcache_memory_gb)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let cpu_swap = (0.0f32, 0.0f32, 0.0f32);
+
+        // The Mamba/GDN slot occupancy (the `0` when the model is not hybrid).
+        let (mamba_used, mamba_total, mamba_used_gb, mamba_budget_gb, mamba_slot_mb) =
+            if let Some(capacity) = self.cfg.mamba_cache_capacity {
+                if capacity > 0 && self.cfg.mamba_slot_bytes > 0 {
+                    let active_slots = (self.running.len()
+                        + self.waiting.len()
+                        + self.cached.len()
+                        + self.transferred.len())
+                        .min(capacity);
+                    let slot_mb = self.cfg.mamba_slot_bytes as f32 / 1024.0f32 / 1024.0f32;
+                    let used_gb = (active_slots * self.cfg.mamba_slot_bytes) as f32 / SIZE_IN_GB as f32;
+                    let budget_gb = self.cfg.mamba_memory_bytes as f32 / SIZE_IN_GB as f32;
+                    (active_slots, capacity, used_gb, budget_gb, slot_mb)
+                } else {
+                    (0, 0, 0.0, 0.0, 0.0)
+                }
+            } else {
+                (0, 0, 0.0, 0.0, 0.0)
+            };
+
+        ResourceGauges {
+            kv_free_blocks: free_blocks,
+            kv_total_blocks: total_blocks,
+            kv_free_tokens: free_blocks * block_size,
+            kv_used_percent: used_percent,
+            kv_used_gb: used_percent / 100.0f32 * kvcache_gb,
+            kv_total_gb: kvcache_gb,
+            cpu_swap_used_frac: cpu_swap.0,
+            cpu_swap_used_gb: cpu_swap.1,
+            cpu_swap_total_gb: cpu_swap.2,
+            mamba_slots_used: mamba_used,
+            mamba_slots_total: mamba_total,
+            mamba_used_gb: mamba_used_gb,
+            mamba_budget_gb: mamba_budget_gb,
+            mamba_slot_mb: mamba_slot_mb,
+            seq_running: self.running.len(),
+            seq_waiting: self.waiting.len(),
+            seq_cached: self.cached.len(),
+            seq_transferred: self.transferred.len(),
+            mmu_pressure: self.physical_pressure,
+            mmu_idle_vram_bytes: self.mmu_idle_vram_bytes,
+            mmu_total_vram_bytes: self.mmu_total_vram_bytes,
+        }
     }
 
     /// Check if the given token is a tool call end token

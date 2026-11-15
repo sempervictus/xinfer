@@ -7,10 +7,12 @@ pub mod parser;
 pub mod server;
 pub mod streaming;
 use crate::core::engine::LLMEngine;
+use crate::telemetry::Telemetry;
 use crate::server::streaming::Streamer;
 use crate::transfer::PdRole;
 use crate::utils::chat_template::Message;
 use crate::utils::config::{EngineConfig, SamplingParams};
+use crate::utils::env::qos_enabled;
 use crate::utils::guidance::GuidanceTokens;
 use crate::utils::image::{
     compute_tokens_per_image, get_tensor_raw_data, load_image_from_base64, load_image_from_url,
@@ -1664,6 +1666,35 @@ pub async fn run_server(
         .route("/v1/lora/unload", post(server::unload_lora_adapter))
         .route("/tokenize", post(server::tokenize))
         .route("/detokenize", post(server::detokenize))
+        // The Prometheus /metrics endpoint (the QoS-gated, the no the endpoint when
+        // QoS is off). The scrape returns the global counters (the cumulative), the
+        // per-seq gauges (the 60s aging), the scheduler resource gauges (the KV/mamba/
+        // swap occupancy), + the static build info. The QoS controller's live gauges
+        // (the gain/ITL/histogram) are published by the periodic background task.
+        .route(
+            "/metrics",
+            get(|state: axum::extract::State<std::sync::Arc<ServerData>>| async move {
+                if !qos_enabled() {
+                    return (
+                        axum::http::StatusCode::NOT_FOUND,
+                        "the /metrics endpoint is only available when QoS is enabled",
+                    )
+                        .into_response();
+                }
+                // The publish the live QoS + scheduler resource gauges to the
+                // registry before the scrape (the no the values). The monolith
+                // engine calls publish_telemetry directly (the no the actor
+                // branch's fire-and-forget SchedMessage::PublishTelemetry RPC,
+                // which was the F-QoS-3 stale-gauges defect).
+                state.engine.read().publish_telemetry();
+                let body = Telemetry::global().scrape();
+                axum::http::Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+                    .into_response()
+            }),
+        )
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB body size limit
         .layer(cors)
         .with_state(Arc::new(server_data));

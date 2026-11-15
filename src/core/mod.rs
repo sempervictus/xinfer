@@ -3,6 +3,8 @@ pub mod engine;
 pub mod lora;
 pub mod mem_budget;
 pub mod prefix_cache;
+pub mod qos;
+pub mod qos_histogram;
 pub mod runner;
 pub mod scheduler;
 pub mod sequence;

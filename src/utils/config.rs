@@ -1,4 +1,5 @@
 // src/utils/config.rs
+use crate::core::qos::QosConfig;
 use crate::transfer::PdConfig;
 use llguidance::api::TopLevelGrammar;
 #[cfg(feature = "python")]
@@ -424,6 +425,7 @@ pub fn normalize_prefill_chunk_size(size: usize) -> usize {
 /// residency budgets. The `eviction_policy` is the LRU/FIFO selection. The
 /// `pinned` are the SLA-guaranteed tenants. The `allow_base_fallback`
 /// controls the unknown-adapter behavior (the 404 vs the base-model fallback).
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct LoraConfig {
     /// The (name, source) pairs (the `--lora NAME=SOURCE`, repeatable).
@@ -529,6 +531,10 @@ pub struct EngineConfig {
     #[serde(default)]
     pub lora: LoraConfig,
     pub enable_tool_grammar: bool,
+    /// QoS scheduling policy (class-aware admission, adaptive chunking, KV-aware
+    /// budgeting). Disabled by default = prior operation.
+    #[serde(default)]
+    pub qos: QosConfig,
 }
 
 fn default_num_nodes() -> usize {
@@ -650,6 +656,10 @@ pub struct EngineConfig {
     pub lora: LoraConfig,
     #[pyo3(get, set)]
     pub enable_tool_grammar: bool,
+    /// QoS scheduling policy (class-aware admission, adaptive chunking, reservations).
+    /// Disabled by default = prior operation.
+    #[serde(default)]
+    pub qos: QosConfig,
 }
 
 impl EngineConfig {
@@ -670,7 +680,6 @@ impl EngineConfig {
     }
 }
 
-#[cfg(not(feature = "python"))]
 impl EngineConfig {
     pub fn new(
         model_id: Option<String>,
@@ -777,6 +786,7 @@ impl EngineConfig {
             draft_model,
             lora,
             enable_tool_grammar,
+            qos: QosConfig::default(),
         }
     }
 }
