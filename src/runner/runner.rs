@@ -251,6 +251,23 @@ pub fn run_runner() -> anyhow::Result<()> {
                 &MessageType::InitAck(true),
                 false,
             )?;
+            // Report the runner's final (post-MMU-clamp) num_blocks + the physical memory
+            // view (the live free, the total VRAM) to the master, so the master's
+            // BlockManager uses the same block count the runner allocated (the no
+            // the block-table out-of-bounds) + the master's memory map reconciles the
+            // per-rank live free (the rank 0 is probed directly, the other ranks
+            // arrive here). The struct form matches the master's receive (the no the
+            // stale tuple form, which left rank 1..N at total=0).
+            let (num_blocks, live_free, total_vram) = runner.memory_report();
+            send_local(
+                &mut vec![stream.try_clone()?],
+                &MessageType::NumBlocksReport {
+                    num_blocks,
+                    live_free,
+                    total_vram,
+                },
+                false,
+            )?;
             runner
         }
         _ => {

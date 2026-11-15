@@ -4,6 +4,9 @@ use super::scheduler::{Scheduler, KVCACHE_SWAP_THRESHOLD};
 use super::sequence::Sequence;
 use crate::core::scheduler::PD_PREFILL_STATUS_CHECK_COOLING_PERIOD;
 use crate::core::sequence::{DecodeSequence, SequenceStatus};
+use crate::core::lora::{DEFAULT_LORA_MAX_BYTES, DEFAULT_LORA_MAX_TENANTS};
+use crate::core::mem_budget::{apply_kv_cache_cap, GpuReserve, MemoryMapSet, PoolBudget};
+use crate::utils::env::moe_offload_auto;
 use crate::core::GenerationOutput;
 use crate::models::layers::distributed::Comm;
 #[cfg(feature = "nccl")]
@@ -24,7 +27,7 @@ use crate::utils::guidance::{build_llg_factory, extract_guidance_tokens, Guidanc
 use crate::utils::guidance_grammar::{get_reasoning_token_strings, is_reasoning_grammar};
 use crate::utils::heartbeat::heartbeat_worker;
 use crate::utils::image::{get_image_config, ImageData, ImageProcessConfig};
-use crate::utils::kvcache_allocator::KVCacheAllocator;
+use crate::utils::kvcache_allocator::{hybrid_mamba_graph_capture_max_batch, KVCacheAllocator};
 use crate::utils::progress::{progress_worker, ProgressReporter};
 use crate::utils::progress::{spawn_progress_thread, ProgressLike};
 use crate::utils::{chat_template::ChatTemplate, prepare_engine_config};
@@ -45,7 +48,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
 use tokio::runtime::Runtime;
@@ -113,6 +116,13 @@ pub struct LLMEngine {
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
+/// The live physical memory map. One device map per rank plus one host map,
+    /// owned by value on the engine (no internal lock, no Arc). Mutated under the
+    /// engine write lock (the boot carve, the grow, the reclaim, the probe
+    /// refresh). The scheduler and the QoS controller read it for the physical
+    /// pressure signal, which unlike the block occupancy is aware of the idle
+    /// VRAM.
+    mem_map: MemoryMapSet,
 }
 
 impl LLMEngine {
@@ -212,6 +222,13 @@ impl LLMEngine {
 
         #[cfg(feature = "nvtx")]
         let use_runner = false;
+
+        // The per-rank physical memory view (the live free, the total VRAM), captured
+        // from the runner NumBlocksReport (the use_runner branch) and used to
+        // reconcile the memory map (the C7). Empty on the Thread runner (the in-
+        // process, the rank 0 probe is direct).
+        let mut per_rank_live_free: Vec<u64> = Vec::new();
+        let mut per_rank_total_vram: Vec<u64> = Vec::new();
 
         let runners = if !use_runner {
             let device = crate::utils::new_device(device_ids[0])?;
@@ -354,6 +371,17 @@ impl LLMEngine {
             use rayon::iter::IntoParallelRefIterator;
             use rayon::iter::ParallelIterator;
             let engine_config = std::sync::OnceLock::<EngineConfig>::new();
+            // Collect each runner's reported final num_blocks (the post-MMU-clamp value) +
+            // the physical memory view (the live free, the total VRAM), keyed by the
+            // local rank. The master's BlockManager uses the min block count across
+            // ranks (the no the block-table OOB) + the memory map reconciles the per-
+            // rank live free (the rank 0 is probed directly, the other ranks arrive
+            // here). The key is the local rank (the device_ids index), not the
+            // completion order (the par_iter is non-deterministic, so a Vec would
+            // misalign the per-rank reconciliation).
+            let reported_blocks: Arc<Mutex<HashMap<usize, (usize, u64, u64)>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            let reported_blocks_loop = reported_blocks.clone();
             let runner_streams: Result<Vec<LocalStream>> = device_ids
                 .par_iter()
                 .enumerate()
@@ -397,6 +425,13 @@ impl LLMEngine {
                     }
 
                     // Build init message with global rank for NCCL
+                    let is_hybrid_mamba = matches!(
+                        model_type,
+                        ModelType::Qwen3_5
+                            | ModelType::Qwen3_5MoE
+                            | ModelType::Qwen4
+                            | ModelType::Qwen3VL
+                    );
                     let mut econfig_rank = econfig.clone();
                     econfig_rank.device_ids = Some(vec![*dev_id]);
                     let init_msg = MessageType::Init(RunnerInitRequest {
@@ -424,7 +459,7 @@ impl LLMEngine {
                         econfig.kvcache_dtype = allocator.resolved_kvcache_dtype();
                         let device_ids = econfig.device_ids.clone().unwrap_or(vec![0]);
                         match allocator.plan(&device_ids, &mut econfig) {
-                            Ok(_) => {
+                             Ok(_) => {
                                 crate::log_info!("KVCache allocation successfully planned!");
                             }
                             Err(e) => {
@@ -432,6 +467,44 @@ impl LLMEngine {
                                 panic!("Failed to allocate KVCache: {:?}", e);
                             }
                         }
+                        // Apply the SAME MMU KV-cache cap the runner applies
+                        // (runner.rs), so the master's `num_blocks` (the
+                        // scheduler's `BlockManager`) agrees with the runner's
+                        // `config.num_blocks` (the flashinfer validation bound).
+                        // Without this, the master allocates block IDs up to its
+                        // (larger) `num_blocks`, the runner validates against its
+                        // (smaller, MMU-capped) `num_blocks`, + a block ID in
+                        // [runner_num_blocks, master_num_blocks) is OOB (the
+                        // mmu-fail.log flashinfer block-index errorob).
+                        let device_ids2 = econfig.device_ids.clone().unwrap_or(vec![0]);
+                        let allocator2 = KVCacheAllocator::new(&econfig, &config, dtype);
+                        let total_free = allocator2
+                            .get_available_memory(&device_ids2)
+                            .unwrap_or(0);
+                        // The measured GPU reserve (the single source of truth, shared
+                        // with the runner via the allocator). The graph slice is the
+                        // model-aware `cuda_graph_bytes` (zero for non-graph builds,
+                        // no VRAM idled); the workspace is the model-aware
+                        // `compute_workspace_budget` (scales with the actual prefill
+                        // chunk + model width, not a percentage of F).
+                        let graph_capture_batch = if is_hybrid_mamba {
+                            hybrid_mamba_graph_capture_max_batch(econfig.max_num_parallel_reqs)
+                        } else {
+                            econfig.max_num_parallel_reqs.max(1)
+                        };
+                        let max_model_len = econfig.max_model_len.unwrap_or(32768);
+                        let reserve = GpuReserve::compute(&allocator2, graph_capture_batch, max_model_len);
+                        let mut budget = PoolBudget::new(total_free, &reserve);
+                        if moe_offload_auto() {
+                            let _moe_granted = budget.cap(budget.remainder());
+                        }
+                        if !econfig.lora.adapters.is_empty() {
+                            let _lora_granted = budget.cap(econfig.lora.max_bytes.unwrap_or(DEFAULT_LORA_MAX_BYTES) as u64);
+                        }
+                        if is_hybrid_mamba {
+                            let _gdn_granted = budget.cap(econfig.mamba_memory_bytes as u64);
+                        }
+                        apply_kv_cache_cap(&budget, &mut econfig);
                         econfig
                     });
 
@@ -441,6 +514,24 @@ impl LLMEngine {
                         "init kvcache",
                         global_rank,
                     )?;
+
+                    // Collect the runner's final (post-MMU-clamp) num_blocks so the
+                    // master's BlockManager (the scheduler) uses the same block count
+                    // the runner actually allocated (avoiding the block-table out-of-bounds
+                    // error from a master/runner num_blocks divergence). The runner reports it via
+                    // NumBlocksReport (the runner/runner.rs, sent after the MMU clamp).
+let reported = match receive_local(&mut stream, false)? {
+                        MessageType::NumBlocksReport {
+                            num_blocks,
+                            live_free,
+                            total_vram,
+                        } => Some((num_blocks, live_free, total_vram)),
+                        _ => None, // the Thread runner (the in-process) does not report; the
+                                   // master's own clamp (above) is used.
+                    };
+                    if let Some(report) = reported {
+                        reported_blocks_loop.lock().unwrap().insert(local_rank, report);
+                    }
 
                     crate::log_info!(
                         "Runner {} (global rank {}) started!",
@@ -458,6 +549,42 @@ impl LLMEngine {
                 econfig = cfg.clone();
                 config.kvcache_dtype = econfig.kvcache_dtype;
             }
+            // Clamp the master's num_blocks to the MIN across all runners' reported
+            // (post-MMU-clamp) values, so the master's BlockManager (the scheduler)
+            // never allocates a block ID the runners' (smaller) pools don't have
+            // (avoiding the flashinfer block-table out-of-bounds error from a
+            // master/runner divergence).
+            let reported = reported_blocks.lock().unwrap();
+            // The min block count across the runner reports (the master must not
+            // allocate a block ID the runners' smaller pools don't have, the no the
+            // flashinfer block-table out-of-bounds). The report is a tuple (the
+            // num_blocks, the live free, the total VRAM); the min is by the num_blocks
+            // (the first element).
+            if let Some(&(min_blocks, _, _)) = reported.values().min_by_key(|(b, _, _)| *b) {
+                if econfig.num_blocks > min_blocks {
+                    crate::log_info!(
+                        "Clamping master num_blocks {} -> {} (the min across runner reports)",
+                        econfig.num_blocks,
+                        min_blocks
+                    );
+                    econfig.num_blocks = min_blocks;
+                }
+            }
+            // The per-rank physical view (the live free, the total VRAM) is captured
+            // for the memory map reconciliation: the rank 0 is probed directly, the
+            // other ranks' live free arrives here. The reports are keyed by the local
+            // rank (the device_ids index), so the reconciliation is rank-aligned (the
+            // no the completion-order Vec, which misaligned the per-rank maps). The
+            // min live free across ranks is the deployment's true idle headroom (the
+            // tightest rank bounds a grow).
+            let rank_count = reported.len().max(1);
+            per_rank_live_free = (0..rank_count)
+                .map(|rank| reported.get(&rank).map(|r| r.1).unwrap_or(0))
+                .collect();
+            per_rank_total_vram = (0..rank_count)
+                .map(|rank| reported.get(&rank).map(|r| r.2).unwrap_or(0))
+                .collect();
+            drop(reported);
 
             let local_streams = runner_streams?;
 
@@ -573,6 +700,148 @@ impl LLMEngine {
 
         log_warn!("Model loaded.\n");
 
+        // The LoRA startup log (the operator visibility): the loaded
+        // adapters + the residency budget. The no-op when no adapter is loaded
+        // (the base model only, the zero overhead).
+        if !econfig.lora.adapters.is_empty() {
+            crate::log_info!(
+                "LoRA: {} adapter(s) loaded ({:?}), budget {} tenants / {} bytes, policy {:?}, pinned {:?}",
+                econfig.lora.adapters.len(),
+                econfig.lora.adapters.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                econfig.lora.max_tenants.unwrap_or(DEFAULT_LORA_MAX_TENANTS),
+                econfig.lora.max_bytes.unwrap_or(DEFAULT_LORA_MAX_BYTES),
+                econfig.lora.eviction_policy,
+                econfig.lora.pinned
+            );
+        }
+
+        // Build the live physical memory map from the finalized econfig (the tier
+        // sizes) plus a fresh total-VRAM probe (the driver ground truth, not the
+        // boot snapshot). The map is owned by value on the engine (no internal
+        // lock); it is mutated under the engine write lock (the grow, the reclaim,
+        // the probe refresh) and read by the scheduler and the QoS controller for
+        // the physical pressure signal, which the block occupancy is blind to.
+        let device_count = econfig.num_shards.unwrap_or(1).max(1);
+        let map_allocator = KVCacheAllocator::new(&econfig, &config, dtype);
+        let is_hybrid_mamba = matches!(
+            model_type,
+            ModelType::Qwen3_5
+                | ModelType::Qwen3_5MoE
+                | ModelType::Qwen4
+                | ModelType::Qwen3VL
+        );
+        let graph_capture_batch = if is_hybrid_mamba {
+            hybrid_mamba_graph_capture_max_batch(econfig.max_num_parallel_reqs)
+        } else {
+            econfig.max_num_parallel_reqs.max(1)
+        };
+        let max_model_len = econfig.max_model_len.unwrap_or(32768);
+        let reserve = GpuReserve::compute(&map_allocator, graph_capture_batch, max_model_len);
+        let kv_bytes = econfig.kvcache_memory_bytes as u64;
+        let gdn_bytes = econfig.mamba_memory_bytes as u64;
+        // The GDN prefix tiers: the device LRU (the mamba_cache_capacity times the
+        // prefix multiplier, the hot turn snapshots) plus the CPU spill (four times
+        // the device capacity, the cold tier). The slot bytes are the mamba_slot_
+        // bytes (the per-snapshot recurrent state). Registering them in the map
+        // makes the GDN footprint part of the physical budget, so an untracked
+        // GDN allocation cannot silently consume the idle VRAM the KV pool needs.
+        // Zero when the model is not hybrid (no GDN tiers).
+        let gdn_device_prefix_bytes = if is_hybrid_mamba {
+            let device_prefix_capacity = econfig
+                .mamba_cache_capacity
+                .unwrap_or(0)
+                .saturating_mul(2); // the effective_mamba_prefix_capacity (the prefix-cache-on multiplier)
+            (device_prefix_capacity as u64).saturating_mul(econfig.mamba_slot_bytes as u64)
+        } else {
+            0
+        };
+        let gdn_cpu_spill_bytes = (gdn_device_prefix_bytes as u128)
+            .saturating_mul(4) // the CPU_PREFIX_CACHE_CAPACITY_MULTIPLIER (the mamba_cache.rs)
+            as u64;
+        let cpu_swap_bytes = (econfig.num_blocks as u64)
+            .saturating_mul(econfig.cpu_mem_fold.unwrap_or(0.5) as u64)
+            .saturating_mul(
+                map_allocator
+                    .per_block_bytes()
+                    .max(1) as u64,
+            );
+        // The live driver probe (the rank 0 cuMemGetInfo, the ground truth for the
+        // idle VRAM). The closure is self-contained: it creates the CudaDevice per
+        // call (the driver query is cheap), so it captures no allocator state. The
+        // None on the non-CUDA build (the computed-free fallback, not a stale
+        // driver value). This makes the map's live_free the physical signal rather
+        // than the boot-time snapshot.
+        #[cfg(feature = "cuda")]
+        let probe: Option<Box<dyn Fn() -> Option<(u64, u64)> + Send + Sync>> = {
+            let probe_dev_id = econfig.device_ids.clone().unwrap_or(vec![0])[0];
+            Some(Box::new(move || {
+                use candle_core::backend::BackendDevice;
+                use candle_core::cuda_backend::cudarc::driver::sys;
+                use candle_core::cuda_backend::CudaDevice;
+                let _ = CudaDevice::new(probe_dev_id).ok()?;
+                let mut free: usize = 0;
+                let mut total: usize = 0;
+                unsafe {
+                    sys::lib()
+                        .cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize)
+                        .result()
+                        .ok()?;
+                }
+                Some((free as u64, total as u64))
+            }))
+        };
+        #[cfg(not(feature = "cuda"))]
+        let probe: Option<Box<dyn Fn() -> Option<(u64, u64)> + Send + Sync>> = None;
+        // The host probe (the sysinfo, the host RAM total + available). The no the
+        // device probe (the cuMemGetInfo), this fills the host map's total (the
+        // physical host RAM, the no the regions sum). The None when sysinfo is
+        // unavailable (the computed-free fallback).
+        let host_probe: Option<Box<dyn Fn() -> Option<(u64, u64)> + Send + Sync>> = {
+            Some(Box::new(|| {
+                let system = sysinfo::System::new();
+                let total = system.total_memory();
+                let available = system.available_memory();
+                Some((available, total))
+            }))
+        };
+        let mut mem_map = MemoryMapSet::from_engine_config(
+            device_count,
+            0, // the total is unknown until the first probe (the physical VRAM, the no the boot free)
+            0, // the weights are untracked; they show up as drift and keep the grow conservative
+            reserve.graph_bytes,
+            reserve.workspace_bytes,
+            kv_bytes,
+            gdn_bytes,
+            gdn_device_prefix_bytes,
+            // The host swap + the GDN spill are per-rank allocations on the shared
+            // host DRAM (each rank's runner allocates its own CPU pool). The host
+            // map shows the deployment total (the device_count times the per-rank).
+            (cpu_swap_bytes as u128).saturating_mul(device_count as u128) as u64,
+            (gdn_cpu_spill_bytes as u128).saturating_mul(device_count as u128) as u64,
+            0, // the PLE table is host-resident, not a device region
+            probe,
+            host_probe,
+        );
+        // The first probe (the rank 0, the direct driver query) fills the total
+        // (the physical VRAM) + the live_free (the current free). The no-probe
+        // builds (the non-CUDA) leave the total at 0 (the computed free is the
+        // fallback, the pressure is 1.0, the conservative).
+        mem_map.refresh_all();
+        crate::log_info!("{}", mem_map.report());
+        // The per-rank reconciliation (the C7): the rank 0 map is probed directly
+        // (the probe closure), the other ranks' live free + total arrive via the
+        // NumBlocksReport (the per_rank_live_free, the per_rank_total_vram). Set
+        // each rank's cached live_free so the map's aggregate pressure + idle reflect
+        // the true per-rank physical state (the no the rank 0 probe only).
+        for (rank, map) in mem_map.devices.iter_mut().enumerate() {
+            if rank < per_rank_live_free.len() {
+                map.live_free = per_rank_live_free[rank];
+            }
+            if rank < per_rank_total_vram.len() && per_rank_total_vram[rank] > 0 {
+                map.total = per_rank_total_vram[rank];
+            }
+        }
+
         let engine = Arc::new(RwLock::new(Self {
             runners,
             scheduler,
@@ -598,6 +867,7 @@ impl LLMEngine {
             img_cfg,
             model_name,
             guidance_tokens,
+            mem_map,
         }));
 
         Self::start_engine(engine.clone());
@@ -657,8 +927,20 @@ impl LLMEngine {
         let requested_max_tokens = max_tokens;
 
         let max_model_len = self.econfig.max_model_len.unwrap_or(max_tokens);
-        //we also need to consider prompt length
-        if length + max_tokens > max_model_len {
+        // The prompt length is accounted against the context bound. When the
+        // operator did not set max_model_len (the fallback is the decode budget),
+        // a prompt longer than the budget leaves no room to decode. Use
+        // saturating_sub so the comparison never underflows, and reject the
+        // request when the prompt consumes the whole context (no room left for
+        // generated tokens).
+        if length >= max_model_len {
+            candle_core::bail!(
+                "Inputs token length {} leaves no room for generated tokens within max_model_len {}",
+                length,
+                max_model_len
+            );
+        }
+        if length.saturating_add(max_tokens) > max_model_len {
             max_tokens = max_model_len - length;
             params.max_tokens = Some(max_tokens);
             log_warn!(
@@ -728,18 +1010,37 @@ impl LLMEngine {
         );
 
         let prompt_required_blocks = self.scheduler.block_manager.required_blocks(&seq);
+        // The live demand is the first prefill chunk, not the whole prompt. The
+        // chunked prefill (the scheduler re-queues the sequence per chunk)
+        // allocates the prompt incrementally, so admission only needs room for one
+        // chunk plus the decode budget. The prefix-netted prompt blocks are capped
+        // at the chunk size: a cold huge-context prompt is admitted on its first
+        // chunk, the rest is prefilled incrementally. The cached case (the iterative
+        // agentic loop) already has a small prompt block count (the uncached tail),
+        // so the cap is a no-op there.
+        let chunk_blocks = self
+            .econfig
+            .effective_prefill_chunk_size()
+            .div_ceil(self.econfig.block_size.max(1));
+        let live_prompt_blocks = prompt_required_blocks.min(chunk_blocks.max(1));
         let requested_decode_blocks = max_tokens.div_ceil(self.econfig.block_size);
         let minimum_decode_budget_tokens = max_tokens.min(REQUEST_ADMISSION_DECODE_BUDGET_TOKENS);
         let minimum_decode_blocks = minimum_decode_budget_tokens.div_ceil(self.econfig.block_size);
         let mut target_required_blocks =
-            prompt_required_blocks.saturating_add(requested_decode_blocks);
+            live_prompt_blocks.saturating_add(requested_decode_blocks);
         let mut minimum_required_blocks =
-            prompt_required_blocks.saturating_add(minimum_decode_blocks);
+            live_prompt_blocks.saturating_add(minimum_decode_blocks);
         let mut available_blocks = self.scheduler.block_manager.get_num_free_blocks();
 
         while target_required_blocks > available_blocks {
             let prev_target = target_required_blocks;
             let target_required_tokens = target_required_blocks * self.econfig.block_size;
+            // Free blocks in order: evict the unrelated prefix leaves (the reference-count
+            // zero only, not the request's own match), then demote the coldest
+            // running suffix to host (the prefix stays on the GPU as the join key),
+            // then grow the KV tier from the idle VRAM. The prior eviction-only loop
+            // could not free the reference-held active blocks, which stalled the
+            // admission.
             let evicted = self
                 .scheduler
                 .evict_prefix_cache_until_free(target_required_blocks);
@@ -751,12 +1052,35 @@ impl LLMEngine {
                     max_tokens
                 );
             }
+            if target_required_blocks > self.scheduler.block_manager.get_num_free_blocks() {
+                // Demote the coldest running suffix to host (the prefix stays on the GPU as
+                // the join key, the GDN boundary is captured). The grow lever (the
+                // map grow plus the block pool reallocation) requires the runner to
+                // actually allocate the extra blocks, so it is not wired here; the
+                // demote is the relief that works with the existing primitives.
+                let demoted = self.scheduler.demote_for_admission(target_required_blocks);
+                if demoted > 0 {
+                    crate::log_warn!(
+                        "Demoted {} KV block(s) to host (the coldest running suffix) for request admission.",
+                        demoted
+                    );
+                }
+            }
             if evicted == 0 && !self.try_release_cache(target_required_tokens) {
                 break;
             }
+            // Recompute the demand using the live (chunk-capped) prompt blocks, not the
+            // whole prompt. Evicting the prefix cache shrinks the match, so the
+            // demand must be re-derived from the current match, or the loop would
+            // keep the stale (larger) figure and never converge.
             let prompt_required_blocks = self.scheduler.block_manager.required_blocks(&seq);
-            target_required_blocks = prompt_required_blocks.saturating_add(requested_decode_blocks);
-            minimum_required_blocks = prompt_required_blocks.saturating_add(minimum_decode_blocks);
+            let chunk_blocks = self
+                .econfig
+                .effective_prefill_chunk_size()
+                .div_ceil(self.econfig.block_size.max(1));
+            let live_prompt_blocks = prompt_required_blocks.min(chunk_blocks.max(1));
+            target_required_blocks = live_prompt_blocks.saturating_add(requested_decode_blocks);
+            minimum_required_blocks = live_prompt_blocks.saturating_add(minimum_decode_blocks);
             available_blocks = self.scheduler.block_manager.get_num_free_blocks();
 
             if evicted > 0 && target_required_blocks >= prev_target {
@@ -767,11 +1091,20 @@ impl LLMEngine {
         if minimum_required_blocks > available_blocks {
             let available_tokens = available_blocks * self.econfig.block_size;
             let required_tokens = minimum_required_blocks * self.econfig.block_size;
+            // Reject with the exact shortfall and the physical context, not a bare "try
+            // later". The operator needs to know how many tokens are free, how many
+            // are needed, how much VRAM is idle, and what to change (grow the pool,
+            // raise the context headroom, or trim the conversation).
+            let idle_gb = self.mem_map.idle_device() as f64 / (1024.0 * 1024.0 * 1024.0);
+            let pressure = self.mem_map.device_pressure();
             candle_core::bail!(
-                "Remaining {} kvcache tokens, but your request requires at least {} tokens (prompt plus {} decode budget tokens), please request later!",
+                "KV pool exhausted: {} tokens free, request needs {} tokens (prompt plus {} decode budget). Idle device VRAM {:.2} GB (pressure {:.0}%). To admit: grow the KV pool, raise the max_model_len headroom, or trim the conversation (the {} uncached prompt tokens exceed the pool).",
                 available_tokens,
                 required_tokens,
-                minimum_decode_budget_tokens
+                minimum_decode_budget_tokens,
+                idle_gb,
+                pressure * 100.0,
+                length
             );
         }
         if target_required_blocks > available_blocks {

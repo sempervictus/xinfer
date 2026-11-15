@@ -44,9 +44,9 @@ impl ShutdownHandle {
                 let _ = s.shutdown(std::net::Shutdown::Both);
             }
             ShutdownHandle::Local(s) => {
-                // The dropping the LocalStream closes the fd, unblocking a parked
-                // read/accept. The explicit drop (the no the implicit end-of-scope)
-                // makes the intent clear.
+                // Dropping the LocalStream closes the file descriptor, which unblocks a
+                // parked read or accept. Drop it explicitly rather than relying on
+                // the implicit end-of-scope drop, to make the intent clear.
                 drop(s);
             }
         }

@@ -96,6 +96,49 @@ pub fn grow_to_free_vram() -> Result<()> {
     Ok(())
 }
 
+/// Grow the expert slots to fit within a byte budget (the MMU cap). Unlike
+/// `grow_to_free_vram` (which reads raw free VRAM), this takes an explicit
+/// byte cap from the centralized memory budget so the MoE-offload pool
+/// cannot over-commit the GPU alongside the KV + GDN + LoRA pools.
+pub fn grow_to_budget(cap_bytes: usize) -> Result<()> {
+    let pools = std::mem::take(&mut *POOLS.lock().unwrap());
+    let Some(first) = pools.first() else {
+        return Ok(());
+    };
+    first
+        .device()
+        .bind_to_thread()
+        .map_err(candle_core::Error::wrap)?;
+    let used: usize = pools.iter().map(|p| p.num_slots() * p.slot_bytes()).sum();
+    // The budget is the cap (the MMU slice), not the free VRAM. The water-fill
+    // distributes the cap across the pools, respecting each pool's expert count.
+    let spec: Vec<_> = pools
+        .iter()
+        .map(|p| (p.num_slots(), p.num_experts(), p.slot_bytes()))
+        .collect();
+    let new = targets(&spec, cap_bytes.saturating_sub(used));
+    for (p, &n) in pools.iter().zip(&new) {
+        if n != p.num_slots() {
+            p.resize(n)?;
+        }
+    }
+    // The freed slots return to the driver only at a sync; the KV planner must see them.
+    first
+        .device()
+        .synchronize()
+        .map_err(candle_core::Error::wrap)?;
+    let (min, max) = (new.iter().min().unwrap(), new.iter().max().unwrap());
+    let experts: usize = spec.iter().map(|s| s.1).sum();
+    crate::log_info!(
+        "MoE offload (budgeted): {}..{} slots per layer (cap {} bytes, {} experts)",
+        min,
+        max,
+        cap_bytes,
+        experts
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::targets;

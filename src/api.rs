@@ -3,7 +3,7 @@ use crate::core::GenerationOutput;
 use crate::server::{build_messages_and_images, run_server, ChatMessage};
 use crate::tools::Tool;
 use crate::utils::chat_template::Message;
-use crate::utils::config::{EngineConfig, SamplingParams};
+use crate::utils::config::{EngineConfig, LoraConfig, SamplingParams};
 use crate::utils::get_dtype;
 use candle_core::{DType, Result};
 use parking_lot::RwLock;
@@ -171,6 +171,7 @@ impl EngineBuilder {
             false,
             None, // num_speculative_tokens
             None, // draft_model
+            LoraConfig::default(), // lora
         );
 
         if let Some(kv_dtype) = self.kvcache_dtype {

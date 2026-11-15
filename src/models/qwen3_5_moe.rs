@@ -12,6 +12,7 @@ use crate::models::layers::moe::{
 use crate::models::layers::others::{embedding, rms_norm, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbedding};
 use crate::models::layers::VarBuilderX;
+use crate::core::lora::apply_embedding_lora;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
 use crate::utils::resolve_qwen3_hybrid_config;
@@ -564,7 +565,7 @@ impl Qwen3_5MoEForCausalLM {
                 comm.clone(),
                 vocab_size,
                 dtype,
-            )?
+            )?.with_lora_module("lm_head".to_string())
         } else {
             let lm_head_vb = if tie_word_embeddings.is_some_and(|x| x) {
                 if is_qvar_builder {
@@ -585,7 +586,7 @@ impl Qwen3_5MoEForCausalLM {
                 &config.quantization_config,
                 &None,
                 dtype,
-            )?
+            )?.with_lora_module("lm_head".to_string())
         };
 
         // Initialize MambaCache
@@ -645,6 +646,7 @@ impl Qwen3_5MoEForCausalLM {
 
     pub fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.embed_tokens.forward(xs)?;
+        let xs = apply_embedding_lora(&xs)?;
         if (self.is_qvar_builder || self.config.quant.is_some()) && xs.dtype() != DType::F32 {
             xs.to_dtype(DType::F32)
         } else {

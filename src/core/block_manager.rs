@@ -16,6 +16,153 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The R7a dense-snapshot gate (the pure decision, the testable without a
+/// `BlockManager`): whether a GDN prefix snapshot should be captured at a given
+/// block boundary. The inputs are the sequence's decode state (the
+/// `has_output` = the `output_ids` non-empty, the `is_final_status` = the
+/// `Finished`/`Cached`/`FinishSwapped`), the configured stride (the
+/// `mamba_snapshot_block_stride_blocks`), + the current full-block count.
+///
+/// The rule: prompt/prefill captures (where `has_output` is false) are always
+/// dense (no stride gate). Decode captures are gated by the stride: when the
+/// stride is 1, every block boundary is captured (the R7a dense snapshots,
+/// avoiding the dropped-KV re-prefill gap); when the stride is greater than 1,
+/// only the stride-aligned boundaries + the final response boundary (where
+/// `is_final_status` is true) are captured (the prior behavior, which bounds the
+/// snapshot memory + LRU churn).
+#[must_use]
+pub fn should_capture_mamba_prefix(
+    has_output: bool,
+    is_final_status: bool,
+    stride_blocks: usize,
+    full_blocks: usize,
+) -> bool {
+    // The prompt/prefill capture (no output tokens yet): always dense.
+    if !has_output {
+        return true;
+    }
+    // The final response boundary (the `Finished`/`Cached`/`FinishSwapped`
+    // states): always captured (no stride gate, the §10.2 sequential tool-turn
+    // alignment).
+    if is_final_status {
+        return true;
+    }
+    // The mid-decode capture: gated by the stride. The stride 1 captures every
+    // block boundary (the R7a dense snapshots); the stride > 1 captures only
+    // the stride-aligned boundaries.
+    full_blocks % stride_blocks.max(1) == 0
+}
+
+/// The `is_final_status` input to the R7a gate (the pure extraction, the
+/// testable without a `Sequence`): the sequence status is one of the
+/// finalization states (the `Finished`/`Cached`/`FinishSwapped`).
+#[must_use]
+pub fn final_decode_snapshot_status(status: &SequenceStatus) -> bool {
+    matches!(
+        status,
+        SequenceStatus::Finished | SequenceStatus::Cached | SequenceStatus::FinishSwapped
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The R7a oracle: the stride-1 gate captures every block boundary (the
+    /// dense snapshots, avoiding the dropped-KV re-prefill gap). The inclusive:
+    /// a mid-decode capture at any full-block count is allowed when the stride
+    /// is 1. The exclusive: the prompt/prefill capture (no output) is
+    /// always dense regardless of the stride.
+    #[test]
+    fn r7a_stride_one_captures_every_boundary() {
+        // The mid-decode (has_output true, not a final status), the stride 1:
+        // every full-block count is captured.
+        for full_blocks in 1..=128 {
+            assert!(
+                should_capture_mamba_prefix(true, false, 1, full_blocks),
+                "the stride-1 mid-decode capture at {} blocks must be dense",
+                full_blocks
+            );
+        }
+        // The prompt/prefill (no output), the stride 1: always captured.
+        assert!(should_capture_mamba_prefix(false, false, 1, 0));
+        assert!(should_capture_mamba_prefix(false, false, 1, 5));
+    }
+
+    /// The R7a oracle: the stride-128 gate captures only the stride-aligned
+    /// boundaries + the final response (the prior behavior, the snapshot churn
+    /// bounded). The inclusive: a mid-decode capture at a stride-aligned block
+    /// (the 128, the 256) is allowed. The exclusive: a mid-decode capture at a
+    /// non-aligned block (the 64, the 100) is suppressed.
+    #[test]
+    fn r7a_stride_128_captures_only_aligned_boundaries() {
+        // The stride-aligned mid-decode captures (the 128, the 256): allowed.
+        assert!(should_capture_mamba_prefix(true, false, 128, 128));
+        assert!(should_capture_mamba_prefix(true, false, 128, 256));
+        // The non-aligned mid-decode captures (the 64, the 100, the 127):
+        // suppressed.
+        assert!(!should_capture_mamba_prefix(true, false, 128, 64));
+        assert!(!should_capture_mamba_prefix(true, false, 128, 100));
+        assert!(!should_capture_mamba_prefix(true, false, 128, 127));
+        // The final response boundary (the `is_final_status` true): always
+        // captured, even at a non-aligned block (the §10.2 tool-turn alignment).
+        assert!(should_capture_mamba_prefix(true, true, 128, 64));
+        assert!(should_capture_mamba_prefix(true, true, 128, 100));
+    }
+
+    /// The R7a oracle: the `final_decode_snapshot_status` extraction matches the
+    /// finalization states (the `Finished`/`Cached`/`FinishSwapped`), not the
+    /// active states (the `Waiting`/`Running`/`Swapped`). The inclusive: the
+    /// three final states return true. The exclusive: the three active states
+    /// return false.
+    #[test]
+    fn final_decode_snapshot_status_matches_finalization_states() {
+        assert!(final_decode_snapshot_status(&SequenceStatus::Finished));
+        assert!(final_decode_snapshot_status(&SequenceStatus::Cached));
+        assert!(final_decode_snapshot_status(&SequenceStatus::FinishSwapped));
+        assert!(!final_decode_snapshot_status(&SequenceStatus::Waiting));
+        assert!(!final_decode_snapshot_status(&SequenceStatus::Running));
+        assert!(!final_decode_snapshot_status(&SequenceStatus::Swapped));
+    }
+
+    /// The R7a oracle: the stride-0 guard (the `max(1)`) prevents a division by
+    /// zero (avoiding a panic when the stride is misconfigured to 0). The
+    /// inclusive: a mid-decode capture with the stride 0 is treated as the
+    /// stride 1 (every boundary, not suppressed). The exclusive: the
+    /// prompt/prefill capture is always dense regardless.
+    #[test]
+    fn r7a_stride_zero_guard_treats_as_stride_one() {
+        // The stride 0 (the misconfigured case): the `max(1)` floors to 1, so every
+        // mid-decode boundary is captured (no division-by-zero panic).
+        for full_blocks in 1..=16 {
+            assert!(
+                should_capture_mamba_prefix(true, false, 0, full_blocks),
+                "the stride-0 guard must treat the capture as the stride 1"
+            );
+        }
+        // The prompt/prefill (no output): always captured.
+        assert!(should_capture_mamba_prefix(false, false, 0, 0));
+    }
+
+    /// The R7a oracle: the full-block count of 0 (no complete block yet)
+    /// is captured when the stride is 1 (the modulo 0 % 1 == 0), but the
+    /// caller (the `capture_mamba_prefix_state`) short-circuits the `full_blocks
+    /// == 0` case before reaching the gate (no snapshot at the 0-block
+    /// boundary). The inclusive: the gate itself allows the 0-block capture when
+    /// the stride is 1 (the modulo is 0). The exclusive: the gate suppresses the
+    /// 0-block capture when the stride is greater than 1 (the 0 % 128 == 0 is true, so the
+    /// gate allows it — the caller's short-circuit is what prevents the 0-block
+    /// snapshot, not the gate).
+    #[test]
+    fn r7a_gate_allows_zero_block_when_stride_divides_zero() {
+        // The 0 % any_stride == 0, so the gate allows the 0-block capture (the
+        // the caller's `full_blocks == 0` short-circuit is what prevents the
+        // 0-block snapshot, not the gate).
+        assert!(should_capture_mamba_prefix(true, false, 128, 0));
+        assert!(should_capture_mamba_prefix(true, false, 1, 0));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Block {
     pub id: usize,
@@ -538,19 +685,18 @@ impl BlockManager {
         if full_blocks == 0 {
             return None;
         }
-        // Keep prompt/prefill captures dense. During decode, capture only at
-        // chunk-size boundaries plus the final response boundary so intermediate
-        // decode blocks do not churn useful prompt snapshots.
-        let final_decode_snapshot = !seq.output_ids.is_empty()
-            && matches!(
-                seq.status,
-                SequenceStatus::Finished | SequenceStatus::Cached | SequenceStatus::FinishSwapped
-            );
-        if !seq.output_ids.is_empty()
-            && !final_decode_snapshot
-            && self.mamba_snapshot_block_stride_blocks > 1
-            && full_blocks % self.mamba_snapshot_block_stride_blocks != 0
-        {
+        // The R7a dense-snapshot gate (the pure decision, testable without a
+        // BlockManager): during decode, capture at every block boundary when the
+        // stride is 1 (avoiding the dropped-KV re-prefill gap, the §10 diagnosis),
+        // or at stride-aligned boundaries + the final response boundary when the
+        // stride is greater than 1 (the prior behavior, which bounds the snapshot
+        // memory + LRU churn).
+        if !should_capture_mamba_prefix(
+            !seq.output_ids.is_empty(),
+            final_decode_snapshot_status(&seq.status),
+            self.mamba_snapshot_block_stride_blocks,
+            full_blocks,
+        ) {
             return None;
         }
         let (seed, seed_block) = seq
@@ -563,7 +709,7 @@ impl BlockManager {
         else {
             return None;
         };
-        let preserve_snapshot = seq.output_ids.is_empty() || final_decode_snapshot;
+        let preserve_snapshot = seq.output_ids.is_empty() || final_decode_snapshot_status(&seq.status);
         match self.try_capture_mamba_prefix_state(seq.id, hash, preserve_snapshot) {
             Ok(true) => {
                 if let Some(&block_id_u32) = seq.block_table.get(full_blocks.saturating_sub(1)) {
@@ -706,8 +852,13 @@ impl BlockManager {
             .as_ref()
             .map(|img| Self::image_seed_and_block(img, tokens, self.block_size))
             .unwrap_or((None, None));
+        // The GDN-pinned block (the last block of the inserted prefix, where the GDN
+        // snapshot is pinned via mamba_prefix_block_by_hash). The internal
+        // eviction must not evict it: doing so orphans the GDN snapshot and
+        // degrades the next match to a raw-KV hit (the re-prefill gap).
+        let preserve_block = blocks.last().copied();
         let PrefixCacheUpdate { inserted, evicted } =
-            prefix_cache.insert_prefix_with_seed(tokens, &blocks, seed, seed_block);
+            prefix_cache.insert_prefix_with_seed(tokens, &blocks, seed, seed_block, preserve_block);
         for block_id in inserted {
             self.increment_block_ref(block_id);
         }
@@ -722,6 +873,25 @@ impl BlockManager {
         self.prefix_cache
             .as_ref()
             .map_or(false, |cache| cache.enabled())
+    }
+
+    /// The R7b atomic boundary commit: insert the KV prefix + capture the GDN
+    /// snapshot at the same token boundary, so the (KV, GDN) pair is valid and
+    /// resumable (avoiding the KV-without-GDN gap from the §10 diagnosis). The prior
+    /// behavior was two separate calls (the `cache_sequence` + the
+    /// `capture_mamba_prefix_state`), and a failure between them left a KV block
+    /// with no GDN snapshot (exactly the dropped-KV re-prefill gap). This wraps
+    /// both in one step, so the resume path (the `allocate_with_prefix` + the
+    /// `resolve_mamba_matched_blocks`) matches both the KV prefix and the GDN
+    /// snapshot at that exact boundary.
+    pub fn commit_prefix_boundary(&mut self, seq: &Sequence, boundary_tokens: usize) {
+        // The GDN capture first (the snapshot at the boundary, so the KV
+        // insert does not evict the boundary block before the GDN state is recorded).
+        // The `preserve` is true (the boundary is a resumable point, so the
+        // decode-time churn does not evict it).
+        let _ = self.capture_mamba_prefix_state(seq, boundary_tokens);
+        // The KV insert (the prefix cache, the refcount-pinned blocks).
+        self.cache_sequence(seq);
     }
 
     pub fn prefix_cache_blocks(&self) -> usize {
@@ -776,7 +946,7 @@ impl BlockManager {
         if num_blocks == 0 {
             return 0;
         }
-        let evicted = prefix_cache.evict_blocks(num_blocks);
+        let evicted = prefix_cache.evict_blocks(num_blocks, None);
         let evicted_count = evicted.len();
         let evicted_blocks = evicted.clone();
         for block_id in evicted {
@@ -796,7 +966,7 @@ impl BlockManager {
                 let Some(prefix_cache) = self.prefix_cache.as_mut() else {
                     break;
                 };
-                prefix_cache.evict_blocks(1)
+                prefix_cache.evict_blocks(1, None)
             };
             if evicted.is_empty() {
                 break;

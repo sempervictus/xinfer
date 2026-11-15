@@ -227,8 +227,12 @@ pub struct KVCacheAllocator {
     use_flashinfer_workspace: bool,
 }
 
-/// Mirrors `skip_flashinfer_init` in `core/runner.rs`.
-fn uses_flashinfer_workspace(econfig: &EngineConfig, config: &Config) -> bool {
+/// Whether FlashInfer GPU workspace is actually used at runtime. The single source
+/// of truth for the FlashInfer usage decision (the dtype, the arch, the GQA group
+/// support). The KV-cache budget reserves the FlashInfer workspace only when this
+/// is true, and the runner initializes the FlashInfer plans only when this is true
+/// (the no a divergence between the reserved bytes and the used bytes).
+pub fn uses_flashinfer_workspace(econfig: &EngineConfig, config: &Config) -> bool {
     #[cfg(not(feature = "flashinfer"))]
     {
         let _ = (econfig, config);
@@ -257,6 +261,24 @@ fn uses_flashinfer_workspace(econfig: &EngineConfig, config: &Config) -> bool {
             return false;
         }
         if matches!(arch, "DeepseekV4ForCausalLM" | "deepseek_v4" | "deepseek4") {
+            return false;
+        }
+        // The FlashInfer prefill/decode kernels only support specific GQA group
+        // sizes. An unsupported group (e.g. 24 Q heads / 2 KV heads, the group 12)
+        // falls back to the native flash path, so the FlashInfer workspace is not
+        // used and must not be reserved. The group is computed from the per-shard
+        // head counts (the TP sharding divides the Q + the KV heads by the world
+        // size, the replicated KV mode when the KV heads are fewer than the world
+        // size).
+        let world = econfig.num_shards.unwrap_or(1).max(1);
+        let qo_heads = config.num_attention_heads / world;
+        let kv_heads = if config.num_key_value_heads >= world {
+            config.num_key_value_heads / world
+        } else {
+            1
+        };
+        let group = qo_heads / kv_heads.max(1);
+        if !matches!(group, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64) {
             return false;
         }
         true
@@ -738,7 +760,7 @@ impl KVCacheAllocator {
     /// Estimate buffers retained by CUDA graph capture for a decode batch.
     /// Capture happens after KV-cache allocation, so this memory is reserved
     /// while choosing both the KV pool and the parallel-request limit.
-    fn cuda_graph_bytes(&self, graph_batch: usize, max_model_len: usize) -> u64 {
+    pub fn cuda_graph_bytes(&self, graph_batch: usize, max_model_len: usize) -> u64 {
         #[cfg(all(feature = "cuda", feature = "graph"))]
         {
             if graph_batch == 0 {

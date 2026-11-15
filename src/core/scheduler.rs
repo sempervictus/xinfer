@@ -354,15 +354,24 @@ impl Scheduler {
                 crate::log_warn!("Evicted {} prefix cache block(s) under pressure.", evicted);
             } else {
                 #[cfg(feature = "cuda")]
-                if !preempt_ids.is_empty() && self.running.len() > 1 {
+                // Swap out the stuck (preempted) sequences to free GPU blocks. The
+                // prior gate (the running.len() > 1) blocked the single-seq swap-out
+                // on the theory that swapping the only sequence is pointless. That
+                // theory holds for a healthy single seq (the no the decode, the no the
+                // swap), but not for a stuck single seq (the no the can_append failing,
+                // the no the pool full): the swap-out frees its GPU blocks (the no the CPU
+                // holds them), the swap-in reclaims them (the no the pool has room after
+                // the swap-out), so the seq makes progress. Without this, a single
+                // stuck seq stalls indefinitely (the no the decode, the no the swap-in).
+                if !preempt_ids.is_empty() {
                     if let Some((idx, _)) = preempt_ids
                         .iter()
                         .map(|&i| (i, &self.running[i]))
                         .min_by_key(|(_, seq)| seq.id)
-                    // swap-out the oldest sequence
+                    // swap-out the oldest stuck sequence
                     {
                         crate::log_warn!(
-                            "Trying to swap out preempt Seq {:?}",
+                            "Swapping out stuck Seq {:?} to free GPU blocks for admission",
                             self.running[idx].id
                         );
                         self.try_swap_out(idx, true);
@@ -398,6 +407,19 @@ impl Scheduler {
             }
             self.block_manager.may_append(seq)?;
             decode_ids.push(idx);
+        }
+        // The stall marker: if running sequences exist but none could be decoded
+        // (the no the can_append failing, the no the pool full), log the reason so a
+        // silent stall is diagnosable. The free block count + the total pool size
+        // show whether the pool is exhausted (the no the prefix cache holding the
+        // blocks, the no the seq's own KV).
+        if decode_ids.is_empty() && !self.running.is_empty() {
+            crate::log_warn!(
+                "[SCHED] {} running seq(s) could not be decoded (the no the can_append failing). Free blocks: {}, total blocks: {}",
+                self.running.len(),
+                self.block_manager.get_num_free_blocks(),
+                self.block_manager.get_num_total_blocks()
+            );
         }
         if !pd_finished_ids.is_empty() {
             self.running.retain(|s| !pd_finished_ids.contains(&s.id));
@@ -786,7 +808,14 @@ impl Scheduler {
             if seq.id == seq_id {
                 crate::log_warn!("Seq {} - cancel requested (status {})", seq.id, seq.status);
                 seq.status = SequenceStatus::Finished;
-                self.block_manager.deallocate(seq);
+                // The R7b resumable partial state: capture the GDN state at the
+                // exact abort point (seq.len(), avoiding the KV-without-GDN gap from
+                // the §10 diagnosis) before releasing, so a later request with the
+                // same prefix restores both tiers and resumes at seq.len() (without
+                // the full re-prefill). The snapshot is CPU-spill-eligible (the
+                // two-tier LRU, the mamba_cache.rs), so it survives a GPU
+                // re-provisioning of that slot.
+                self.block_manager.commit_prefix_boundary(seq, seq.len());
                 break;
             }
         }
@@ -803,6 +832,9 @@ impl Scheduler {
                 crate::log_warn!("Seq {} - cancel requested (status {})", seq.id, seq.status);
             }
             seq.status = SequenceStatus::Finished;
+            // The R7b: the mid-prefill cancel captures the GDN state at the
+            // cached boundary (avoiding the dropped-KV re-prefill gap on resume).
+            self.block_manager.commit_prefix_boundary(&seq, seq.num_cached_tokens);
             self.block_manager.deallocate(&seq);
         }
         if let Some(pos) = self.transferred.iter().position(|seq| seq.id == seq_id) {
@@ -1091,6 +1123,15 @@ impl Scheduler {
                     if !prefix_mode {
                         self.block_manager.deallocate(&seq);
                     }
+                    // The R7b resumable partial state: the swap-out keeps the CPU KV
+                    // (the `swap_out_suffix`) but not the GDN state (the GDN is
+                    // slot-resident on the GPU, the mamba_cache.rs). Capture the GDN
+                    // state at the exact swap boundary (seq.len(), avoiding the
+                    // re-run of the GDN recurrence from zero on a swap-in after a long
+                    // preemption) so the resume restores both tiers. The snapshot is
+                    // CPU-spill-eligible (the two-tier LRU), so it survives a GPU
+                    // re-provisioning of that slot.
+                    self.block_manager.commit_prefix_boundary(&seq, seq.len());
                     // block table need to be reallocated when swapping in
                     self.cached.push(seq.clone());
                     return true;
@@ -1312,6 +1353,48 @@ impl Scheduler {
 
     pub fn evict_prefix_cache_blocks(&mut self, blocks: usize) -> usize {
         self.block_manager.evict_prefix_cache_blocks(blocks)
+    }
+
+    /// Demote the coldest running sequences to the CPU swap tier to free GPU blocks
+    /// for a new admission (the relief-ladder step, C5). Victims are chosen oldest
+    /// first by creation time (FIFO, not LRU-by-access, which would evict the hot
+    /// agentic conversation). Each victim's suffix is swapped to host while its
+    /// prefix stays on the GPU as the join key, and its GDN boundary is captured so
+    /// the resume restores both tiers. The sequence moves to the cached list, where
+    /// it is resumable. Returns the number of GPU blocks freed. This is a no-op when
+    /// nothing is running (the single-request case, where the admission is for the
+    /// only sequence).
+    pub fn demote_for_admission(&mut self, need_blocks: usize) -> usize {
+        let mut freed = 0usize;
+        // The victims: running sequences that can be swapped out (their suffix is
+        // sequence-owned, not a shared prefix). Sorted oldest first.
+        let mut victims: Vec<(usize, usize)> = self
+            .running
+            .iter()
+            .enumerate()
+            .filter(|(_, seq)| self.block_manager.can_swap_out(seq))
+            .map(|(idx, seq)| (idx, seq.created_time()))
+            .collect();
+        victims.sort_by_key(|(_, created)| *created);
+        for (idx, _) in victims {
+            if freed >= need_blocks {
+                break;
+            }
+            // The demote removes the sequence from the running list, so the indices
+            // shift. Re-find the victim by its id, not by the stale index.
+            let Some(seq_id) = self.running.get(idx).map(|s| s.id) else {
+                continue;
+            };
+            let before = self.block_manager.get_num_free_blocks();
+            if self.try_swap_out_by_id(seq_id, true) {
+                let after = self.block_manager.get_num_free_blocks();
+                freed += after.saturating_sub(before);
+            }
+            if self.block_manager.get_num_free_blocks() >= need_blocks {
+                break;
+            }
+        }
+        freed
     }
 
     fn evict_prefix_cache_under_pressure(&mut self) -> usize {

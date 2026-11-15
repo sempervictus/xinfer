@@ -5,6 +5,15 @@ use crate::models::layers::distributed::Comm;
 use crate::models::layers::linear::set_linear_is_prefill;
 use crate::models::layers::VarBuilderX;
 use crate::models::qwen3_5_mtp::Qwen3_5MtpHead;
+use crate::core::lora::{
+    activate_tenant, active_tenant, deactivate_tenant, ensure_tenant_loaded,
+    global_adapter_count, global_adapter_modules, init_global_site_registry, init_lora_registry,
+    lora_execution, set_active_tenant, set_global_registry, set_lora_execution, LoraExecution,
+    LoraRegistry, DEFAULT_LORA_MAX_BYTES,
+};
+use crate::core::mem_budget::{apply_kv_cache_cap, GpuReserve, PoolBudget};
+use crate::utils::env::moe_offload_auto;
+use crate::models::layers::moe_offload::budget::grow_to_budget;
 use crate::server::EmbeddingStrategy;
 use crate::transfer::Transfer;
 #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -42,6 +51,7 @@ use crate::{
 };
 use attention_rs::cache;
 #[cfg(feature = "flashinfer")]
+use crate::utils::kvcache_allocator::uses_flashinfer_workspace;
 use attention_rs::FlashInferMetadata;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor, D};
@@ -187,6 +197,15 @@ pub struct ModelRunner {
     cpu_tq_cache: Option<Vec<CpuTqLayerCache>>,
     pub(crate) device: Device,
     config: EngineConfig,
+    /// The KV cache allocator (the model-aware workspace + graph budget, the
+    /// per_block_bytes geometry). Stored so the runtime KV pool grow (the
+    /// `grow_kv_pool`) can re-plan the allocation without rebuilding the
+    /// allocator from the econfig.
+    kv_allocator: KVCacheAllocator,
+    /// The model compute dtype (the F16/BF16/F32, the no the KV cache dtype). Stored
+    /// so the runtime KV pool grow (the `grow_kv_pool`) can re-init the cache with
+    /// the correct dtype (the no the `init_kv_cache` needs it).
+    dtype: DType,
     #[cfg(all(feature = "cuda", feature = "graph"))]
     pub decode_capturer: GraphCapturer<CudaGraphWrapper<CudaGraphFn>>,
     #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -207,6 +226,31 @@ pub struct ModelRunner {
     pub(crate) mtp_num_speculative: usize,
     /// Optional external DFlash2 drafter.
     pub(crate) dflash_drafter: Option<crate::speculative::DFlashDrafter>,
+    /// The per-instance LoRA registry (the multi-tenant adapter set, the Punica
+    /// shared-base + per-tenant delta). Empty when no adapter is configured.
+    /// The `Mutex` allows the on-demand load (the `ensure_tenant_loaded`, the
+    /// write path) to mutate the registry; the read path (the `apply_lora_delta`)
+    /// locks it briefly.
+    pub(crate) lora_registry: Arc<Mutex<LoraRegistry>>,
+    /// The per-tenant decode graph capturers (the LoRA + the CUDA graph). Each
+    /// loaded LoRA tenant gets its own captured decode graph (the base model +
+    /// that tenant's delta baked in at capture time), so a graph-replayed decode
+    /// for that tenant is fast + correct. The base model (no tenant) uses the
+    /// `decode_capturer`. The empty when no LoRA tenant is loaded (the prior
+    /// single-graph behavior).
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    pub tenant_decode_capturers: Mutex<HashMap<String, GraphCapturer<CudaGraphWrapper<CudaGraphFn>>>>,
+    /// The max number of sequences for the graph capture (the `graph_capture_max_num_seqs`
+    /// from the constructor). Stored so the per-tenant graph capture (the
+    /// `warmup_capture`) can build per-tenant `GraphCapturer`s with the same batch
+    /// sizing as the base capturer.
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    graph_capture_max_num_seqs: usize,
+    /// The model's hidden size (the `Config.hidden_size`), stored for the per-tenant
+    /// graph capture (the `GraphCapturer::new` needs it). The `EngineConfig` does not
+    /// carry the hidden size, so it is stored separately from the model `.
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    graph_hidden_size: usize,
 }
 
 impl ModelRunner {
@@ -242,6 +286,138 @@ impl ModelRunner {
 
     pub(crate) fn block_size(&self) -> usize {
         self.config.block_size
+    }
+
+    /// The runner's final (post-MMU-clamp) KV block count. The worker reports this
+    /// to the master (the `NumBlocksReport`) so the master's `BlockManager` uses the
+    /// same block count the runner actually allocated (avoiding the block-table
+    /// out-of-bounds error from a master/runner `num_blocks` divergence).
+    pub fn num_blocks(&self) -> usize {
+        self.config.num_blocks
+    }
+
+    /// The runner's physical memory report (the `num_blocks`, the live free VRAM, the
+    /// total VRAM). The live free + the total come from the device's cuMemGetInfo (the
+    /// rank's own driver view, the no the master's probe). The master uses this to
+    /// reconcile the per-rank memory map (the rank 0 is probed directly, the other
+    /// ranks arrive here via the NumBlocksReport). The (0, 0) on the non-CUDA build
+    /// (the no driver, the computed-free fallback on the master side).
+    pub fn memory_report(&self) -> (usize, u64, u64) {
+        #[cfg(feature = "cuda")]
+        {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let dev = self.device.as_cuda_device().ok();
+            if dev.is_some() {
+                let mut free: usize = 0;
+                let mut total: usize = 0;
+                unsafe {
+                    sys::lib()
+                        .cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize)
+                        .result()
+                        .ok();
+                }
+                return (self.config.num_blocks, free as u64, total as u64);
+            }
+            (self.config.num_blocks, 0, 0)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            (self.config.num_blocks, 0, 0)
+        }
+    }
+
+    /// Grow the KV pool by `delta_blocks` (the runtime elastic grow, the map's
+    /// `grow_all` actuator). The new pool is a superset of the old (the block
+    /// indices 0..old_num_blocks are unchanged, the live blocks keep their
+    /// indices, not a data migration). The grow is only safe when the pool is
+    /// drained (the no live blocks, the boot-time or the post-full-eviction); with
+    /// live blocks the re-init would drop their KV data (the corruption). The
+    /// caller (the relief ladder) drains the pool (the evict + the demote) before
+    /// the grow.
+    ///
+    /// The FlashInfer plan is not re-built here: the `FlashInferKvParams` (the
+    /// head count, the page size) is unchanged by a pool grow (the model is
+    /// fixed), and the FlashInfer plan (the `num_pages`) is rebuilt lazily on the
+    /// next decode (the `decode_plan_info.is_none()` check). The NIXL re-
+    /// registration is the pd-branch concern (the no the lora grow).
+    ///
+    /// Returns the new block count (the `Ok(0)` when the grow is refused, the DSV4
+    /// backend, the no idle VRAM). The `Err` when the reallocation fails (the OOM,
+    /// the no a partial grow).
+    pub fn grow_kv_pool(&mut self, delta_blocks: usize) -> Result<usize> {
+        if delta_blocks == 0 {
+            return Ok(0);
+        }
+        // The DSV4 hybrid page pool is engine-owned (the attach_hybrid_page_pool,
+        // the Arc shared with the model layers). It is not re-allocatable here (the
+        // model holds the Arc, not a swap-out). The grow is a no-op for the DSV4
+        // backend (the pool is sized at boot, not runtime elastic).
+        if self.kv_allocator.kv_backend() == crate::utils::KvCacheBackend::DeepSeekV4 {
+            return Ok(0);
+        }
+        let old_num_blocks = self.config.num_blocks;
+        let new_num_blocks = old_num_blocks.saturating_add(delta_blocks);
+        // The new allocation (the larger num_gpu_blocks, not the CPU swap change, the
+        // host pool is not a device grow target).
+        let mut new_econfig = self.config.clone();
+        new_econfig.num_blocks = new_num_blocks;
+        let allocation = crate::utils::kvcache_allocator::KVCacheAllocation {
+            num_gpu_blocks: new_num_blocks,
+            #[cfg(feature = "cuda")]
+            num_cpu_blocks: (new_econfig.num_blocks as f32 * new_econfig.cpu_mem_fold.unwrap_or(0.5))
+                as usize,
+            #[cfg(not(feature = "cuda"))]
+            num_cpu_blocks: 1,
+            max_num_seqs: new_econfig.max_num_seqs,
+            max_model_len: new_econfig.max_model_len.unwrap_or(32768),
+            kvcache_memory_bytes: new_econfig.kvcache_memory_bytes,
+            max_num_batched_tokens: new_econfig.max_num_batched_tokens,
+            max_kv_cache_tokens: new_econfig.max_kv_cache_tokens,
+        };
+        // The re-init the GPU pool (the new, larger tensors). The old pool is dropped
+        // (the live blocks' data is in the old tensors, not a copy). The grow is only
+        // safe when the pool is drained (the caller's job, the no a silent data loss).
+        let (new_gpu, new_cpu) = self
+            .kv_allocator
+            .init_kv_cache(&allocation, self.dtype, &self.device, self.config.pd_config.as_ref())
+            .map_err(|e| {
+                crate::log_error!("KV pool grow failed: {e}");
+                e
+            })?;
+        // The swap the pools (the old is dropped, the new is live). The DSV4 re-attach
+        // (the engine-owned Arc, not the re-init).
+        let mut gpu_kv_cache = new_gpu;
+        if let Model::DeepSeekV4(v4) = &self.model {
+            if let GpuKvCache::DeepSeekV4(pool_arc) = &gpu_kv_cache {
+                v4.attach_hybrid_page_pool(pool_arc.clone());
+            }
+            gpu_kv_cache = GpuKvCache::DeepSeekV4(v4.hybrid_pool_arc());
+        }
+        *self.gpu_kv_cache.lock().unwrap_or_else(|e| e.into_inner()) = gpu_kv_cache;
+        *self.cpu_kv_cache.lock().unwrap_or_else(|e| e.into_inner()) = new_cpu;
+        // The update the config (the master/runner agreement, the no the block-table
+        // out-of-bounds divergence).
+        self.config.num_blocks = new_num_blocks;
+        crate::log_info!(
+            "KV pool grown: {} -> {} blocks (the delta {})",
+            old_num_blocks,
+            new_num_blocks,
+            delta_blocks
+        );
+        Ok(new_num_blocks)
+    }
+
+    /// The cached per-request sampling strategy (the target's post-sampling
+    /// distribution for the lossless rejection-sampling verify). The `None`
+    /// when no per-request override is cached (the model's base sampling).
+    pub(crate) fn cached_sampling(&self) -> Option<CachedSamplingParams> {
+        self.cached_sampling.read().clone()
+    }
+
+    /// Whether this runner is the rank-0 shard (the authoritative NCCL all-reduce
+    /// makes all ranks agree, so rank-0 logs are the single source of truth).
+    pub(crate) fn is_first_rank(&self) -> bool {
+        self.is_first_rank
     }
 
     #[cfg(feature = "flashinfer")]
@@ -367,6 +543,14 @@ impl ModelRunner {
             config.mtp_max_verify_tokens = max_seqs.saturating_mul(spec_tokens.saturating_add(1));
         }
 
+        // Initialize the global LoRA site registry (the centralized
+        // site registration) before the model is built. The model constructors
+        // register their LoRA sites into this registry via the
+        // register_lora_site (called from each wrapped linear's
+        // with_lora_module). The registry is a OnceLock (set once, no
+        // re-set), so this is a no-op if already set.
+        init_global_site_registry();
+
         let model = crate::build_model!(
             model_type,
             vb,
@@ -457,9 +641,13 @@ impl ModelRunner {
             None
         };
 
-        // XINFER_MOE_OFFLOAD=auto: grow expert slots into free VRAM before the KV cache is sized.
-        #[cfg(feature = "cuda")]
-        crate::models::layers::moe_offload::budget::grow_to_free_vram()?;
+// The centralized GPU memory budget (the MMU) carve is performed AFTER the
+        // allocator is created + the `UsableMemoryLeft` update (see below), so it
+        // uses the FINAL econfig (the MoE/LoRA/GDN pool needs) + a single free-VRAM
+        // probe shared with the allocator. The priority order (the CUDA best
+        // practice: the models stay resident, the swappable pools are sized by
+        // importance): graph workspace → MoE-offload experts → LoRA bank → GDN
+        // slots → KV cache (the elastic remainder).
 
         let allocator = if let Some(s) = stream {
             use crate::runner::{receive_local, send_local, MessageType};
@@ -482,16 +670,89 @@ impl ModelRunner {
             econfig.kvcache_dtype = allocator.resolved_kvcache_dtype();
             config.kvcache_dtype = econfig.kvcache_dtype;
             let device_ids = econfig.device_ids.clone().unwrap_or(vec![0]);
-            match allocator.plan(&device_ids, econfig) {
-                Ok(_) => {
-                    crate::log_info!("KVCache allocation successfully planned!");
-                }
-                Err(e) => {
-                    candle_core::bail!("KVCache allocation failed: {}", e);
-                }
-            }
-            allocator
+match allocator.plan(&device_ids, econfig) {
+                 Ok(_) => {
+                     crate::log_info!("KVCache allocation successfully planned!");
+                 }
+                 Err(e) => {
+                     candle_core::bail!("KVCache allocation failed: {}", e);
+                 }
+             }
+             allocator
         };
+
+        // The centralized GPU memory budget (the MMU) carve, performed AFTER the
+        // allocator is created + the `UsableMemoryLeft` update, so it uses the
+        // FINAL econfig (the MoE/LoRA/GDN pool needs) + a single free-VRAM probe
+        // shared with the allocator. The priority order (the CUDA best practice:
+        // the models stay resident, the swappable pools are sized by importance):
+        // measured graph workspace → measured transient workspace → MoE-offload
+        // experts → LoRA bank → GDN slots → KV cache (the elastic remainder).
+        let device_ids = econfig.device_ids.clone().unwrap_or(vec![0]);
+        let total_free = allocator.get_available_memory(&device_ids).unwrap_or(0);
+        // The measured GPU reserve (the single source of truth, shared with the
+        // master via the allocator). The graph slice is the model-aware
+        // `cuda_graph_bytes` (zero for non-graph builds, no VRAM idled); the
+        // workspace is the model-aware `compute_workspace_budget` (scales with
+        // the actual prefill chunk + model width, not a percentage of F).
+        let is_hybrid_mamba_model = match &model {
+            Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen4(_) => true,
+            Model::Qwen3VL(m) => m.uses_hybrid_mamba_text_model(),
+            _ => false,
+        };
+        let graph_capture_batch = if is_hybrid_mamba_model {
+            hybrid_mamba_graph_capture_max_batch(econfig.max_num_parallel_reqs)
+        } else {
+            econfig.max_num_parallel_reqs.max(1)
+        };
+        let max_model_len = econfig.max_model_len.unwrap_or(32768);
+        let reserve = GpuReserve::compute(&allocator, graph_capture_batch, max_model_len);
+        let mut budget = PoolBudget::new(total_free, &reserve);
+        // The MoE-offload experts grow into the remainder, but the KV cache keeps
+        // its admission-demand floor (so the MoE carve does not nullify the floor,
+        // the D4 interaction). The floor is computed against the full remainder
+        // (before the MoE carve), so it is always satisfiable.
+        let moe_expert_cap = if moe_offload_auto() {
+            let moe_cap = budget.remainder();
+            budget.cap(moe_cap) as usize
+        } else {
+            0
+        };
+        let lora_bank_cap = if econfig.lora.adapters.is_empty() {
+            0
+        } else {
+            let lora_need = econfig.lora.max_bytes.unwrap_or(DEFAULT_LORA_MAX_BYTES) as u64;
+            budget.cap(lora_need) as usize
+        };
+        let gdn_slots_cap = if is_hybrid_mamba_model {
+            let gdn_need = econfig.mamba_memory_bytes as u64;
+            budget.cap(gdn_need) as usize
+        } else {
+            0
+        };
+        let kv_cache_cap = budget.remainder();
+        crate::log_info!(
+            "{}",
+            budget.report(&[
+                ("graphs", reserve.graph_bytes),
+                ("workspace", reserve.workspace_bytes),
+                ("moe_experts", moe_expert_cap as u64),
+                ("lora_bank", lora_bank_cap as u64),
+                ("gdn_slots", gdn_slots_cap as u64),
+                ("kv_cache", kv_cache_cap),
+            ])
+        );
+        // XINFER_MOE_OFFLOAD=auto: grow expert slots into the budget's MoE slice.
+        #[cfg(feature = "cuda")]
+        grow_to_budget(moe_expert_cap)?;
+
+        // The KV cache is the elastic last pool of the memory budget. Cap its
+        // block count at the budget's KV slice (so the KV pool does not over-
+        // commit the GPU alongside the MoE + LoRA + GDN pools). Uses the same
+        // shared helper the master applies (engine.rs), so the master's and the
+        // runner's `num_blocks` always agree (avoiding the block-table out-of-
+        // bounds divergence).
+        apply_kv_cache_cap(&budget, econfig);
 
         let allocation = crate::utils::kvcache_allocator::KVCacheAllocation {
             num_gpu_blocks: econfig.num_blocks,
@@ -507,12 +768,7 @@ impl ModelRunner {
             max_kv_cache_tokens: econfig.max_kv_cache_tokens,
         };
 
-        let is_hybrid_mamba_model = match &model {
-            Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen4(_) => true,
-            Model::Qwen3VL(m) => m.uses_hybrid_mamba_text_model(),
-            _ => false,
-        };
-        let mamba_cache_capacity = if is_hybrid_mamba_model {
+        let mut mamba_cache_capacity = if is_hybrid_mamba_model {
             econfig
                 .mamba_cache_capacity
                 .unwrap_or_else(|| {
@@ -524,6 +780,21 @@ impl ModelRunner {
         } else {
             0
         };
+        // The GDN/mamba slots are capped at the memory budget's GDN slice (so
+        // the mamba pool does not over-commit the GPU alongside the KV + MoE +
+        // LoRA pools). The cap is in slots (the gdn_slots_cap bytes divided by the
+        // per-slot byte size).
+        if is_hybrid_mamba_model && gdn_slots_cap > 0 && econfig.mamba_slot_bytes > 0 {
+            let gdn_slot_cap = gdn_slots_cap / econfig.mamba_slot_bytes;
+            if mamba_cache_capacity > gdn_slot_cap {
+                crate::log_info!(
+                    "GDN slots capped by the memory budget: {} -> {}",
+                    mamba_cache_capacity,
+                    gdn_slot_cap
+                );
+                mamba_cache_capacity = gdn_slot_cap;
+            }
+        }
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
         let graph_capture_max_num_seqs = if is_hybrid_mamba_model {
@@ -548,6 +819,24 @@ impl ModelRunner {
                 }
             }
         }
+
+        // The LoRA + the CUDA graph interaction: the LoRA delta is applied inside the
+        // wrapped linears' forward (the `if let Some(delta)` branch), which is a
+        // runtime data-dependent branch the CUDA graph cannot capture. The graph
+        // is captured with the base model (no tenant active), so a graph-
+        // replayed decode runs the base-model path. For a LoRA tenant, that
+        // tenant's decode must run on a per-tenant captured graph (the base model
+        // + that tenant's delta baked in at capture time), not the base graph.
+        //
+        // The strategy: the graph capture stays enabled (not the global disable
+        // that killed the base-model throughput). At capture time (the
+        // `warmup_capture`), after the base graph is captured, a per-tenant graph
+        // is captured for each loaded LoRA tenant (the tenant set active during
+        // that capture, so the delta is baked in). At replay time (the `run`),
+        // the runner selects the graph matching the active tenant (the base graph
+        // when no tenant, the tenant's graph when that tenant is active). A tenant
+        // with no captured graph (e.g. loaded after capture) falls back to the
+        // eager path for that tenant only.
 
         let prefix_cache_enabled = econfig.prefix_cache.unwrap_or(false);
         let mut mamba_prefix_capacity =
@@ -657,34 +946,10 @@ impl ModelRunner {
         };
 
         #[cfg(feature = "flashinfer")]
-        let has_heterogeneous_head_dim =
-            matches!(model_type, ModelType::Gemma3) || matches!(model_type, ModelType::Gemma4);
-
-        // FlashInfer prefill/decode kernels only support specific GQA group
-        // sizes (see attention-rs flashinfer.rs); e.g. Qwen3.8-Flash-Next has
-        // 24 Q heads / 2 KV heads (group 12) which is unsupported — fall back
-        // to the native flash paged-attention path instead of failing at
-        // decode-plan time.
-        #[cfg(feature = "flashinfer")]
-        let flashinfer_gqa_supported = {
-            let world = comm.world_size();
-            let qo_heads = config.num_attention_heads / world;
-            let kv_heads = if config.num_key_value_heads >= world {
-                config.num_key_value_heads / world
-            } else {
-                1 // replicated KV mode
-            };
-            let group = qo_heads / kv_heads.max(1);
-            matches!(group, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64)
-        };
-
-        #[cfg(feature = "flashinfer")]
-        let skip_flashinfer_init = config.kvcache_dtype.is_turboquant()
-            || (config.kvcache_dtype.is_fp8_keys() && !attention_rs::has_flashinfer_fp8_e4m3())
-            || has_heterogeneous_head_dim
-            || !flashinfer_gqa_supported
-            // V4 never consumes FlashInfer attention; skip its MLA workspace.
-            || matches!(model_type, ModelType::DeepSeekV4);
+        // The FlashInfer usage decision is the shared predicate (the
+        // uses_flashinfer_workspace, the kvcache_allocator), so the runner's
+        // plan initialization and the budget's workspace reserve always agree.
+        let skip_flashinfer_init = !uses_flashinfer_workspace(econfig, config);
         #[cfg(feature = "flashinfer")]
         let flashinfer_kv_params = if skip_flashinfer_init {
             None
@@ -842,6 +1107,22 @@ impl ModelRunner {
             }
         }
 
+        // The per-instance LoRA registry (the multi-tenant adapter set, the Punica
+        // shared-base + per-tenant delta). Computed before the struct (the device is
+        // still available). Empty when no adapter is configured (the prior operation).
+        // The `Mutex` allows the on-demand load (the ensure_tenant_loaded) to mutate
+        // the registry; the read path locks it briefly.
+        let lora_registry = std::sync::Arc::new(std::sync::Mutex::new(
+            init_lora_registry(econfig, &device, dtype, Some(lora_bank_cap as u64))?,
+        ));
+        // Set the process-wide registry (the wrapped linears consult it during
+        // the forward pass). The same `Arc<Mutex>` is stored in the runner (no
+        // a second copy). When the registry is empty (no LoRA configured), the
+        // global is not set (the layers take the fast path, no lookup).
+        if !lora_registry.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            set_global_registry(lora_registry.clone());
+        }
+
         Ok(Self {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),
@@ -849,6 +1130,8 @@ impl ModelRunner {
             cpu_tq_cache,
             device,
             config: econfig.clone(),
+            kv_allocator: allocator.clone(),
+            dtype,
             #[cfg(all(feature = "cuda", feature = "graph"))]
             decode_capturer: GraphCapturer::new(
                 wrapper,
@@ -892,11 +1175,24 @@ impl ModelRunner {
             mtp_head,
             mtp_num_speculative,
             dflash_drafter,
+            lora_registry,
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            tenant_decode_capturers: Mutex::new(HashMap::new()),
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            graph_capture_max_num_seqs,
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            graph_hidden_size: config.hidden_size,
         })
     }
 
     pub fn has_dflash_drafter(&self) -> bool {
         self.dflash_drafter.is_some()
+    }
+
+    /// Whether the instance has a LoRA registry (the multi-tenant adapters loaded).
+    /// The `true` when at least one tenant is registered (the `--lora` set).
+    pub fn has_lora(&self) -> bool {
+        !self.lora_registry.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Initialize MTP head for speculative decoding.
@@ -1040,47 +1336,244 @@ impl ModelRunner {
             }
         }
 
+        // LoRA tenant selection (the per-request adapter, the Punica shared-base +
+        // per-tenant delta). Each sequence in the batch carries its own `lora_tenant`
+        // (the `SamplingParams.lora_tenant`), so one forward pass can serve rows from
+        // different tenants (the batched multi-tenant). The `LoraExecution`
+        // carries the per-row tenant ids; the wrapped linears consult it via
+        // `apply_lora_delta` (the batched delta when set, the single-tenant
+        // `active_tenant` otherwise). The `None` row (no tenant) uses the base
+        // model. This is set BEFORE the graph-replay block so the decode path can
+        // select the per-tenant captured graph (the tenant's delta baked in).
+        let (row_tenants, row_stacks): (Vec<Option<String>>, Vec<Vec<String>>) = match &seqs {
+            Seqs::SeqRefs(seqs) => (
+                seqs.iter().map(|s| s.sampling_params.lora_tenant.clone()).collect(),
+                seqs.iter().map(|s| s.sampling_params.lora_tenants.clone()).collect(),
+            ),
+            Seqs::DecodeVec(seqs) => (
+                seqs.iter().map(|s| s.sampling_params.lora_tenant.clone()).collect(),
+                seqs.iter().map(|s| s.sampling_params.lora_tenants.clone()).collect(),
+            ),
+        };
+        // The distinct tenants across both the single-tenant + the stacked paths
+        // (the on-demand load + the activate cover all of them).
+        let mut distinct_tenants: Vec<String> = row_tenants
+            .iter()
+            .filter_map(|t| t.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        for stack in &row_stacks {
+            for t in stack {
+                if !distinct_tenants.contains(t) {
+                    distinct_tenants.push(t.clone());
+                }
+            }
+        }
+        // On-demand load: ensure each distinct tenant's adapter is
+        // resident before the forward. No-op when the tenant is already resident
+        // or the source is unknown (base model fallback).
+        for tenant in &distinct_tenants {
+            ensure_tenant_loaded(tenant);
+        }
+        // Two-tier LRU: activate each distinct tenant for this
+        // batch (the in-batch bank slot). The active set is capped by the
+        // max_active; the over-cap LRU active tenant is deactivated
+        // (the bank slot freed, the weights stay registered).
+        for tenant in &distinct_tenants {
+            activate_tenant(tenant);
+        }
+        // Reject the request if any active tenant loaded 0 adapter modules (the
+        // adapter was configured but its modules did not map to this model's
+        // LoRA sites, or the tensor discovery failed). Running the base model
+        // silently would mask the misconfiguration; the operator must fix the
+        // adapter or remove it. The `allow_base_fallback` (the server-side)
+        // governs UNKNOWN adapter names (the 404 vs the fallback); a KNOWN
+        // adapter that loaded 0 modules is a hard error (no silent base).
+        for tenant in &distinct_tenants {
+            let count = global_adapter_count(tenant);
+            if count == 0 {
+                crate::log_error!(
+                    "[LoRA] tenant '{tenant}' has 0 adapter modules resident; rejecting the request (the adapter loaded no modules — check the startup checkpoint layout + the model's LoRA sites)"
+                );
+                candle_core::bail!(
+                    "LoRA tenant '{tenant}' loaded 0 adapter modules; the request cannot run with the adapter. Fix the adapter checkpoint (the tensor naming) or the model's LoRA site registration, then restart."
+                );
+            }
+        }
+        // The concise residency proof (the count + the distinct layer count, not
+        // the full module dump). Logged ONCE per (seq_id, tenant) pair,
+        // process-wide (the static proven set, not the thread_local which
+        // re-proves per thread). So the per-decode-step tenant activation does
+        // not spam the log. The full module list is logged once at startup (the
+        // init_lora_registry). Gated to rank-0 only (not the 4× per-rank spam
+        // in a TP run — all ranks see the same tenant, so rank-0's log is the
+        // representative one).
+        if self.is_first_rank {
+            static PROVEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, String)>>> =
+                std::sync::OnceLock::new();
+            let proven = PROVEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            let seq_ids: Vec<usize> = match &seqs {
+                Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
+                Seqs::DecodeVec(seqs) => seqs.iter().map(|s| s.id).collect(),
+            };
+            for &seq_id in &seq_ids {
+                let tenant = match &seqs {
+                    Seqs::SeqRefs(seqs) => seqs.iter().find(|s| s.id() == seq_id).and_then(|s| s.sampling_params.lora_tenant.clone()),
+                    Seqs::DecodeVec(seqs) => seqs.iter().find(|s| s.id == seq_id).and_then(|s| s.sampling_params.lora_tenant.clone()),
+                };
+                let Some(tenant) = tenant else { continue }; // no tenant for this seq (the base model)
+                let first_proof = proven.lock().unwrap().insert((seq_id, tenant.clone()));
+                if first_proof {
+                    let count = global_adapter_count(&tenant);
+                    let modules = global_adapter_modules(&tenant);
+                    let layer_count = modules.iter()
+                        .filter_map(|m| m.strip_prefix("layers.").and_then(|rest| rest.split('.').next()))
+                        .collect::<std::collections::HashSet<_>>()
+                        .len();
+                    crate::log_info!(
+                        "[LoRA] seq {seq_id} tenant '{tenant}' active: {count} adapter module(s) across {layer_count} layer(s), delta will be applied"
+                    );
+                }
+            }
+        }
+        let any_stack = row_stacks.iter().any(|s| !s.is_empty());
+        if distinct_tenants.len() <= 1 && !any_stack {
+            // The single tenant (or no tenant): the thread-local fast path.
+            set_active_tenant(distinct_tenants.first().cloned());
+            set_lora_execution(None);
+        } else {
+            // The multi-tenant batch OR the stacked (additive multi-adapter) case:
+            // the per-row mapping (the LoraExecution). The stacked path is used
+            // when any row carries a non-empty tenant stack.
+            set_active_tenant(None);
+            set_lora_execution(Some(LoraExecution {
+                row_tenants,
+                row_stacks,
+            }));
+        }
+
         #[cfg(all(feature = "cuda", feature = "graph"))]
         {
             let input_batch = input_ids.dim(0)?;
             let require_exact_graph = input_metadata.mamba_slot_mapping.is_some();
-            let can_replay = if require_exact_graph {
-                self.decode_capturer.is_exact_captured(input_batch)
+            // The decode capturer: the per-tenant capturer when a single
+            // tenant is active + a graph was captured for it (the tenant's delta
+            // baked in), otherwise the base capturer (no tenant, or a tenant
+            // with no captured graph). The per-tenant graph is the fast base model
+            // + that tenant's LoRA delta (captured with the tenant active), so
+            // the replay is fast + correct for that tenant.
+            let active_tenant = active_tenant();
+            // Hold the lock across the replay (the capturer is borrowed from the
+            // map, so dropping it early would be a use-after-drop). The guard is dropped at the end of
+            // the block.
+            let mut tenant_capturers = self.tenant_decode_capturers.lock().unwrap_or_else(|e| e.into_inner());
+            let use_tenant_capturer = active_tenant
+                .as_ref()
+                .and_then(|t| tenant_capturers.get(t))
+                .is_some();
+            let capturer = if use_tenant_capturer {
+                // The active_tenant is guaranteed Some here (the use_tenant_capturer
+                // check passed, which requires the tenant to be in the map).
+                tenant_capturers
+                    .get(active_tenant.as_ref().unwrap())
+                    .unwrap()
             } else {
-                self.decode_capturer.is_captured(input_batch)
+                &self.decode_capturer
+            };
+            let can_replay = if require_exact_graph {
+                capturer.is_exact_captured(input_batch)
+            } else {
+                capturer.is_captured(input_batch)
             };
             if !is_prefill && can_replay {
                 let logits = match &self.model {
                     Model::Qwen3_5(model) => {
                         let _guard = model.lock_mamba_cache_for_graph();
-                        self.decode_capturer
-                            .replay(&input_ids, &positions, &input_metadata)?
+                        capturer.replay(&input_ids, &positions, &input_metadata)?
                     }
                     Model::Qwen3_5MoE(model) => {
                         let _guard = model.lock_mamba_cache_for_graph();
-                        self.decode_capturer
-                            .replay(&input_ids, &positions, &input_metadata)?
+                        capturer.replay(&input_ids, &positions, &input_metadata)?
                     }
                     Model::Qwen4(model) => {
                         let _guard = model.lock_mamba_cache_for_graph();
-                        self.decode_capturer
-                            .replay(&input_ids, &positions, &input_metadata)?
+                        capturer.replay(&input_ids, &positions, &input_metadata)?
                     }
                     Model::Qwen3VL(model) => {
                         if let Some(_guard) = model.lock_mamba_cache_for_graph() {
-                            self.decode_capturer
-                                .replay(&input_ids, &positions, &input_metadata)?
+                            capturer.replay(&input_ids, &positions, &input_metadata)?
                         } else {
-                            self.decode_capturer
-                                .replay(&input_ids, &positions, &input_metadata)?
+                            capturer.replay(&input_ids, &positions, &input_metadata)?
                         }
                     }
-                    _ => self
-                        .decode_capturer
-                        .replay(&input_ids, &positions, &input_metadata)?,
+                    _ => capturer.replay(&input_ids, &positions, &input_metadata)?,
                 };
                 let output_ids = self.sample(&logits, seqs, is_prefill)?;
                 return Ok(output_ids);
+            }
+            // The lazy per-tenant capture (R5): when a tenant is active but
+            // has no captured graph (the bounded `warmup_capture` skipped it, or
+            // it was loaded after capture), capture it now on first use so the
+            // subsequent decodes for that tenant are graph-replayed (the fast
+            // path). The capture is one-time per tenant (no repeated
+            // captures); the VRAM is committed only for tenants actually in the
+            // active set.
+            if !is_prefill
+                && !use_tenant_capturer
+                && active_tenant.is_some()
+                && tenant_capturers.get(active_tenant.as_ref().unwrap()).is_none()
+            {
+                let tenant = active_tenant.as_ref().unwrap().clone();
+                let kv_guard = self.get_kv_cache();
+                let kv_pairs = kv_guard.as_pairs();
+                set_active_tenant(Some(tenant.clone()));
+                let wrapper = crate::graph_wrapper!(
+                    &self.model,
+                    &self.device,
+                    {
+                        Qwen3 => EmbedInputs,
+                        Qwen3MoE => EmbedInputs,
+                        Qwen3_5 => EmbedInputs,
+                        Qwen3_5MoE => EmbedInputs,
+                        Qwen4 => EmbedInputs,
+                        LLaMa => EmbedInputs,
+                        LLaMa4 => NoneArg,
+                        Phi4 => EmbedInputs,
+                        GLM4 => EmbedInputs,
+                        GLM4MoE => EmbedInputs,
+                        GLM4MoeLite => EmbedInputs,
+                        DeepSeek => EmbedInputs,
+                        DeepSeekV4 => EmbedInputs,
+                        GLM5 => EmbedInputs,
+                        Mistral3VL => NoneArg,
+                        Gemma3 => NoneArg,
+                        Gemma4 => EmbedInputs,
+                        Qwen3VL => NoneArg,
+                        MiniMax => EmbedInputs,
+                    }
+                );
+                let mut capturer = GraphCapturer::new(
+                    wrapper,
+                    self.graph_capture_max_num_seqs,
+                    self.config.max_model_len.unwrap_or(32768),
+                    self.config.block_size,
+                    self.graph_hidden_size,
+                    #[cfg(feature = "flashinfer")]
+                    &self.flashinfer_kv_params,
+                    matches!(
+                        self.model_type,
+                        ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
+                    ),
+                );
+                if capturer.capture(&self.device, kv_pairs).is_ok() {
+                    crate::log_info!(
+                        "Captured the per-tenant decode graph for LoRA tenant '{tenant}' (lazy, on first use)"
+                    );
+                    tenant_capturers.insert(tenant.clone(), capturer);
+                }
+                set_active_tenant(None);
+                drop(kv_guard);
             }
         }
 
@@ -1148,7 +1641,16 @@ impl ModelRunner {
         let _prefill_guard = set_linear_is_prefill(is_prefill);
         let kv_guard = self.get_kv_cache();
         let kv_pairs = kv_guard.as_pairs();
-        let logits = if let Some(drafter) = self.dflash_drafter.as_ref() {
+        // The DFlash drafter is a separate base model (not the LoRA target). When a
+        // LoRA tenant is active, the DFlash draft would not match the LoRA-applied
+        // target (the verify would reject the drafts), so the DFlash path is disabled
+        // for LoRA tenants (fall to the MTP/plain path, which DOES get the
+        // LoRA delta via the wrapped target linears).
+        let dflash_active = self.dflash_drafter.is_some()
+            && active_tenant().is_none()
+            && lora_execution().map_or(true, |exec| exec.distinct_tenants() == 0);
+        let logits = if dflash_active {
+            let drafter = self.dflash_drafter.as_ref().unwrap();
             let target_layer_ids = drafter.target_layer_ids();
             let (logits, hidden_states) = self.model.forward_collecting_layers(
                 &input_ids,
@@ -1213,6 +1715,12 @@ impl ModelRunner {
         let output_ids = self.sample(&logits, seqs, is_prefill)?;
         #[cfg(feature = "nvtx")]
         nvtx::range_pop!();
+        // Two-tier LRU: deactivate the batch's tenants after the
+        // forward (the bank slots freed, the weights stay registered). No-op
+        // when no tenant was activated (the base model, the empty distinct set).
+        for tenant in &distinct_tenants {
+            deactivate_tenant(tenant);
+        }
         Ok(output_ids)
     }
 
@@ -2021,6 +2529,93 @@ impl ModelRunner {
         let kv_cache_lock = self.gpu_kv_cache.lock().unwrap();
         let kv_pairs = kv_cache_lock.as_pairs();
         self.decode_capturer.capture(&self.device, kv_pairs)?;
+
+        // The per-tenant decode graphs (the LoRA + the CUDA graph): for each
+        // loaded LoRA tenant, capture a dedicated decode graph with that tenant's
+        // delta baked in (the tenant set active during the capture, so the
+        // wrapped linears' `apply_lora_delta` branch is taken + frozen into the
+        // graph). The base graph (captured above, no tenant active) serves
+        // the no-tenant requests. Each tenant graph is stored in
+        // `tenant_decode_capturers`, keyed by the tenant id, so the decode path
+        // can select the matching graph at replay time.
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        {
+            // The per-tenant graph capture is bounded by the active set (the
+            // `max_active` bank slots), not the loaded set (avoiding the O(tenants)
+            // unbounded capture that exhausts VRAM or stalls boot, the D5 defect).
+            // The tenants beyond the cap are captured lazily on first use (the
+            // runner falls back to eager for an uncaptured tenant, the prior
+            // behavior), so VRAM is only committed for tenants actually in the
+            // active set.
+            let (tenant_names, max_active) = {
+                let reg = self.lora_registry.lock().unwrap_or_else(|e| e.into_inner());
+                (reg.tenant_names(), reg.max_active())
+            };
+            let capture_limit = if max_active > 0 {
+                max_active
+            } else {
+                tenant_names.len()
+            };
+            for tenant in tenant_names.iter().take(capture_limit) {
+                set_active_tenant(Some(tenant.clone()));
+                let wrapper = crate::graph_wrapper!(
+                    &self.model,
+                    &self.device,
+                    {
+                        Qwen3 => EmbedInputs,
+                        Qwen3MoE => EmbedInputs,
+                        Qwen3_5 => EmbedInputs,
+                        Qwen3_5MoE => EmbedInputs,
+                        Qwen4 => EmbedInputs,
+                        LLaMa => EmbedInputs,
+                        LLaMa4 => NoneArg,
+                        Phi4 => EmbedInputs,
+                        GLM4 => EmbedInputs,
+                        GLM4MoE => EmbedInputs,
+                        GLM4MoeLite => EmbedInputs,
+                        DeepSeek => EmbedInputs,
+                        DeepSeekV4 => EmbedInputs,
+                        GLM5 => EmbedInputs,
+                        Mistral3VL => NoneArg,
+                        Gemma3 => NoneArg,
+                        Gemma4 => EmbedInputs,
+                        Qwen3VL => NoneArg,
+                        MiniMax => EmbedInputs,
+                    }
+                );
+                let mut capturer = GraphCapturer::new(
+                    wrapper,
+                    self.graph_capture_max_num_seqs,
+                    self.config.max_model_len.unwrap_or(32768),
+                    self.config.block_size,
+                    self.graph_hidden_size,
+                    #[cfg(feature = "flashinfer")]
+                    &self.flashinfer_kv_params,
+                    matches!(
+                        self.model_type,
+                        ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
+                    ),
+                );
+                if capturer.capture(&self.device, kv_pairs).is_ok() {
+                    crate::log_info!(
+                        "Captured the per-tenant decode graph for LoRA tenant '{tenant}'"
+                    );
+                    self.tenant_decode_capturers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(tenant.clone(), capturer);
+                }
+            }
+            if capture_limit < tenant_names.len() {
+                crate::log_info!(
+                    "LoRA tenant graph capture bounded to {} of {} loaded tenants (the active set); the remaining {} are captured lazily on first use",
+                    capture_limit,
+                    tenant_names.len(),
+                    tenant_names.len() - capture_limit
+                );
+            }
+            set_active_tenant(None);
+        }
 
         if self.mtp_num_speculative > 0 {
             // self.decode_capturer.model.sync()?;

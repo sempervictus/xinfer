@@ -177,7 +177,7 @@ impl PrefixCache {
     }
 
     pub fn insert_prefix(&mut self, tokens: &[u32], blocks: &[usize]) -> PrefixCacheUpdate {
-        self.insert_prefix_with_seed(tokens, blocks, None, None)
+        self.insert_prefix_with_seed(tokens, blocks, None, None, None)
     }
 
     pub fn insert_prefix_with_seed(
@@ -186,6 +186,7 @@ impl PrefixCache {
         blocks: &[usize],
         seed: Option<u64>,
         seed_block: Option<usize>,
+        preserve_block: Option<usize>,
     ) -> PrefixCacheUpdate {
         if !self.enabled() {
             return PrefixCacheUpdate {
@@ -262,7 +263,7 @@ impl PrefixCache {
             .len()
             .saturating_sub(self.config.max_cached_blocks);
         let evicted = if excess > 0 {
-            self.evict_blocks(excess)
+            self.evict_blocks(excess, preserve_block)
         } else {
             Vec::new()
         };
@@ -270,7 +271,7 @@ impl PrefixCache {
         PrefixCacheUpdate { inserted, evicted }
     }
 
-    pub fn evict_blocks(&mut self, mut num_blocks: usize) -> Vec<usize> {
+    pub fn evict_blocks(&mut self, mut num_blocks: usize, preserve_block: Option<usize>) -> Vec<usize> {
         let mut evicted = Vec::new();
         while num_blocks > 0 {
             let Some((hash, access_id)) = self.leaf_lru.pop_front() else {
@@ -283,6 +284,15 @@ impl PrefixCache {
                 continue;
             };
             if entry.access_id != access_id || entry.children > 0 {
+                continue;
+            }
+            // Preserve the GDN-pinned boundary block: the GDN tier just captured a
+            // snapshot pinned to this block, so evicting it would orphan the
+            // snapshot and degrade the next match to a raw-KV hit (the re-prefill
+            // gap). Skip the leaf and re-insert it at the LRU back so it stays in
+            // rotation (a pop without re-insert would pin it out of the LRU).
+            if Some(entry.block_id) == preserve_block {
+                self.leaf_lru.push_back((hash, access_id));
                 continue;
             }
             let entry = self.entries.remove(&hash).unwrap();

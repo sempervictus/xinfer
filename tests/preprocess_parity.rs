@@ -22,7 +22,7 @@ use candle_core::DType;
 
 use xinfer::core::engine::LLMEngine;
 use xinfer::utils::chat_template::Message;
-use xinfer::utils::config::{EngineConfig, SamplingParams};
+use xinfer::utils::config::{EngineConfig, LoraConfig, SamplingParams};
 
 fn integration_enabled() -> bool {
     std::env::var("XINFER_INTEGRATION_TEST")
@@ -76,6 +76,7 @@ fn build_econfig() -> EngineConfig {
         false,                               // enable_tool_grammar
         None,                                // num_speculative_tokens
         None,                                // draft_model
+        LoraConfig::default(),        // lora
     )
 }
 

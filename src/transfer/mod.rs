@@ -164,8 +164,8 @@ pub struct TqLayerIpcHandles {
 }
 
 /// TurboQuant buffer data for a single layer (TCP path). The raw byte fields
-/// use RawBytes (the compact MsgPack binary encoding, the no the ~50%-inflated
-/// array-of-ints encoding).
+/// use RawBytes (the compact MsgPack binary encoding, rather than the ~50%-
+/// inflated array-of-ints encoding).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TqLayerTcpData {
     pub k_absmax: Option<RawBytes>,
@@ -193,7 +193,7 @@ pub enum KVTransferHandle {
         /// Raw bytes of the KV cache data, copied block-by-block from the server's CPU.
         /// `Vec` is over `num_layers`. `(k_bytes, v_bytes)`.
         /// The inner `RawBytes` contains all blocks for that layer, concatenated,
-        /// encoded as compact MsgPack binary (the no the ~50%-inflated array form).
+        /// encoded as compact MsgPack binary (not the ~50%-inflated array form).
         layer_data: Vec<(RawBytes, RawBytes)>,
         /// The number of blocks (tokens) in the sequence.
         num_blocks: usize,

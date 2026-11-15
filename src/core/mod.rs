@@ -1,5 +1,7 @@
 pub mod block_manager;
 pub mod engine;
+pub mod lora;
+pub mod mem_budget;
 pub mod prefix_cache;
 pub mod runner;
 pub mod scheduler;

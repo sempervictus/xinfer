@@ -263,6 +263,18 @@ pub enum MessageType {
     ClearBlocksResponse(bool),
 
     UsableMemoryLeft(EngineConfig),
+    /// The runner→master report of the final (post-MMU-clamp) `num_blocks`, so the
+    /// master's `BlockManager` (the scheduler) uses the same block count the runner
+    /// actually allocated (avoiding the block-table out-of-bounds error from a
+    /// master/runner divergence). The `live_free` and the `total_vram` are the
+    /// runner's physical memory view (the cuMemGetInfo, the rank's own), reported so
+    /// the master's memory map can reconcile the per-rank live free (rank 0 is
+    /// probed directly, the other ranks arrive here).
+    NumBlocksReport {
+        num_blocks: usize,
+        live_free: u64,
+        total_vram: u64,
+    },
     /// shutdown subprocesses
     Shutdown,
 }
@@ -728,6 +740,21 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
             send_local(
                 &mut vec![stream.try_clone()?],
                 &MessageType::InitAck(true),
+                false,
+            )?;
+            // Report the runner's final (post-MMU-clamp) num_blocks + the physical memory
+            // view (the live free, the total VRAM) to the master, so the master's
+            // BlockManager uses the same block count the runner allocated (the no
+            // the block-table out-of-bounds) + the master's memory map reconciles the
+            // per-rank live free.
+            let (num_blocks, live_free, total_vram) = runner.memory_report();
+            send_local(
+                &mut vec![stream.try_clone()?],
+                &MessageType::NumBlocksReport {
+                    num_blocks,
+                    live_free,
+                    total_vram,
+                },
                 false,
             )?;
             runner
