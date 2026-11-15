@@ -180,8 +180,43 @@ pub fn spec_graph() -> bool {
 ///
 /// Back-compat: `XINFER_SPEC_PARALLEL_DRAFT=1`/`true`/`yes` parses as `Some(1)`
 /// (single-seq); a numeric value (e.g. `2`) is `Some(2)`. This replaces the old
-/// bool `spec_parallel_draft` + the separate `dflash_parallel_slots` (now a
-/// deprecated alias).
+/// bool `spec_parallel_draft` + the separate `dflash_parallel_slots` (the latter
+/// removed as a dead deprecated alias).
+/// Whether grammar VOB masking is offloaded to the CUDA sampler (the mask is passed to
+/// `sample_cuda_masked` and applied inside the fused top-k stage) instead of biasing the
+/// logits on the CPU via `where_cond`. Default: offload on CUDA builds. Set
+/// `XINFER_SPEC_MASK_OFFLOAD=0` to force the CPU (where_cond) path.
+pub const SPEC_MASK_OFFLOAD_ENV: &str = "XINFER_SPEC_MASK_OFFLOAD";
+static SPEC_MASK_OFFLOAD: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_mask_offload() -> bool {
+    *SPEC_MASK_OFFLOAD.get_or_init(|| {
+        cfg!(feature = "cuda")
+            && !matches!(
+                env::var(SPEC_MASK_OFFLOAD_ENV)
+                    .ok()
+                    .as_deref()
+                    .map(|v| v.trim().eq_ignore_ascii_case("0") || v.trim().eq_ignore_ascii_case("false")),
+                Some(true)
+            )
+    })
+}
+
+/// Use the VOB bitset path for grammar sampling (8x less data than F32 mask).
+/// Requires `XINFER_SPEC_MASK_OFFLOAD=1` (default on CUDA) AND this flag.
+pub const VOB_SAMPLING_ENV: &str = "XINFER_VOB_SAMPLING";
+static VOB_SAMPLING: OnceLock<bool> = OnceLock::new();
+
+pub fn vob_sampling() -> bool {
+    *VOB_SAMPLING.get_or_init(|| {
+        cfg!(feature = "cuda")
+            && env::var(VOB_SAMPLING_ENV)
+                .ok()
+                .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+    })
+}
+
 pub const SPEC_PARALLEL_DRAFT_ENV: &str = "XINFER_SPEC_PARALLEL_DRAFT";
 static SPEC_PARALLEL_DRAFT: OnceLock<Option<usize>> = OnceLock::new();
 
@@ -289,6 +324,98 @@ pub fn spec_dynamic_k() -> bool {
             .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false)
     })
+}
+
+/// When set to "1" or "true", the grammar constrains all generation including
+/// reasoning. Default is "0" (two-phase reasoning: unconstrained reasoning,
+/// constrained response).
+pub const LLG_FULL_ENV: &str = "XINFER_LLG_FULL";
+static LLG_FULL: OnceLock<bool> = OnceLock::new();
+
+pub fn llg_full_enabled() -> bool {
+    *LLG_FULL.get_or_init(|| {
+        env::var(LLG_FULL_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// `XINFER_MAX_REASONING_TOKENS=N` sets the reasoning token budget. The budget
+/// drives the sampling bias in `apply_reasoning_bias` (the runner): as the
+/// per-sequence reasoning token count approaches N, a positive logit bias is
+/// added to the end-of-reasoning token, ramping to a strong push at N so the
+/// model is steered to end reasoning. This is a sampling intervention, not a
+/// grammar constraint — it works with or without a grammar active. The
+/// `None` when unset (no budget, no steering).
+pub const MAX_REASONING_TOKENS_ENV: &str = "XINFER_MAX_REASONING_TOKENS";
+static MAX_REASONING_TOKENS: OnceLock<Option<usize>> = OnceLock::new();
+
+pub fn max_reasoning_tokens() -> Option<usize> {
+    *MAX_REASONING_TOKENS.get_or_init(|| {
+        env::var(MAX_REASONING_TOKENS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
+}
+
+/// `XINFER_DEBUG_LLG=1` enables verbose llg (grammar) debug logging (the grammar
+/// resyncs, the anti-loop kicks, the grammar init). Default off.
+pub const DEBUG_LLG_ENV: &str = "XINFER_DEBUG_LLG";
+static DEBUG_LLG: OnceLock<bool> = OnceLock::new();
+
+pub fn debug_llg() -> bool {
+    *DEBUG_LLG.get_or_init(|| {
+        env::var(DEBUG_LLG_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+// the anti-loop detector (the loop-defense)
+// The master switch (default OFF = zero overhead, the detector is not even
+// constructed) + the probe-forward depth (the confirmation horizon for a stable
+// loop). The parsing is factored into pure helpers (the testable primitives);
+// the OnceLock getters are the process-wide caching wrappers.
+
+/// `XINFER_ANTI_LOOP=1` enables the in-flight closed-loop detector + the
+/// anti-loop kick. Default OFF (the overhead: the detector is not constructed,
+/// the OBSERVE/APPLY points are no-ops).
+pub const ANTI_LOOP_ENV: &str = "XINFER_ANTI_LOOP";
+
+/// `XINFER_REPETITION_PROBE_DEPTH` (default 512): the probe-forward horizon that
+/// confirms a candidate loop period is STABLE (a true closed loop keeps
+/// repeating across the depth; a one-off phrase repeat does not).
+pub const REPETITION_PROBE_DEPTH_ENV: &str = "XINFER_REPETITION_PROBE_DEPTH";
+pub const DEFAULT_REPETITION_PROBE_DEPTH: usize = 512;
+
+static ANTI_LOOP: OnceLock<bool> = OnceLock::new();
+static REPETITION_PROBE_DEPTH: OnceLock<usize> = OnceLock::new();
+
+/// Pure parsing primitive (the testable core): the anti-loop flag from the raw
+/// env string. Inclusive: "1"/"true"/"yes" (case-insensitive) are on. Exclusive:
+/// anything else (including unset) is off.
+fn parse_anti_loop_flag(raw: Option<String>) -> bool {
+    raw.map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Pure parsing primitive: the probe depth from the raw env string. Inclusive: a
+/// positive integer is used. Exclusive: unset / non-numeric / zero all fall back
+/// to the default (512) (a zero depth would confirm nothing).
+fn parse_probe_depth(raw: Option<String>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_REPETITION_PROBE_DEPTH)
+}
+
+pub fn anti_loop_enabled() -> bool {
+    *ANTI_LOOP.get_or_init(|| parse_anti_loop_flag(env::var(ANTI_LOOP_ENV).ok()))
+}
+
+pub fn repetition_probe_depth() -> usize {
+    *REPETITION_PROBE_DEPTH
+        .get_or_init(|| parse_probe_depth(env::var(REPETITION_PROBE_DEPTH_ENV).ok()))
 }
 
 pub fn mamba_snapshot_block_stride_blocks(default: usize) -> usize {

@@ -95,7 +95,7 @@ pub trait CudaGraphModule {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor>;
     fn report_graph_pool_usage(&self) -> Result<()>;
     /// The current + peak CUDA graph memory pool usage (bytes). The (0, 0) when
@@ -320,14 +320,14 @@ where
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
         (self.module)(
             input_ids,
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
         )
     }
 

@@ -313,10 +313,14 @@ mod tests {
         let env = ApproximateTokEnv::single_byte_env();
         let factory = ParserFactory::new_simple(&env).unwrap();
         let grm = TopLevelGrammar::from_lark("start: <[97]> <[98]> <[99]>\n".to_string());
-        let mut state = GuidanceState::new_from_grammar_with_reasoning(
+        let mut state = GuidanceState::new_from_grammar_with_markers(
             std::sync::Arc::new(factory),
             &grm,
-            Vec::new(),
+            Vec::new(), // reasoning_end_ids
+            Vec::new(), // tool_call_start_ids
+            Vec::new(), // tool_call_end_ids
+            None,       // reasoning_budget
+            false,      // log_rank0
         )
         .unwrap();
         state.commit_token(97).unwrap(); // the anchor 'a' committed; now 'b' (98) is forced
@@ -377,7 +381,7 @@ mod tests {
         use crate::utils::guided_decoding::GuidedDecoding;
         // A `GuidedDecoding` with no factory (the no guidance) yields no state, so
         // `mask_stream_for` is `None` (the gate-off / unguided no-op).
-        let gd = GuidedDecoding::new(None);
+        let gd = GuidedDecoding::new(None, false);
         assert!(
             gd.mask_stream_for(42).is_none(),
             "an unguided seq (the no state) has no MaskStream (the no draft masking)"
@@ -410,5 +414,32 @@ mod tests {
             verify_masks[0].is_allowed(97),
             "the draft-side + verify-side slot-0 masks agree on the disallowed token"
         );
+    }
+
+    // The verify-side mask is ACTIVE (the no regression to the prior
+    // `masked_logits = logits.clone()` no-op): applying the `project_verify_masks`
+    // rows to a logits tensor via `apply_vob_to_logits_row` must -inf the illegal
+    // tokens (the forcing singleton leaves only the forced token finite). This is
+    // the exact composition the MTP + DFlash verify paths now use, so a regression
+    // to an unmasked clone would be caught here.
+    #[test]
+    fn verify_side_mask_actually_masks_logits() {
+        use crate::utils::guided_decoding::apply_vob_to_logits_row;
+        let committed = forcing_state();
+        // The verify rows for the draft trajectory [98, 99] (the post-anchor state).
+        let rows = committed.project_masks(&[98, 99], 3).unwrap();
+        assert_eq!(rows.len(), 3, "one mask row per verify position");
+        // Row 0 is the post-anchor singleton {98}: a logits row with all tokens
+        // finite must have every token except 98 driven to -inf.
+        let vocab = 256usize; // the single-byte env vocab
+        let mut logits_row = vec![5.0f32; vocab];
+        apply_vob_to_logits_row(&mut logits_row, &rows[0]);
+        assert_eq!(logits_row[98], 5.0, "the forced token 98 keeps its logit (the mask allows it)");
+        assert_eq!(logits_row[97], f32::NEG_INFINITY, "token 97 (illegal at row 0) is -inf'd");
+        assert_eq!(logits_row[99], f32::NEG_INFINITY, "token 99 (illegal at row 0) is -inf'd");
+        // The count of finite tokens must be exactly 1 (the singleton), proving the
+        // mask is active (an unmasked clone would leave all 256 finite).
+        let finite = logits_row.iter().filter(|&&x| x.is_finite()).count();
+        assert_eq!(finite, 1, "the forcing row is a singleton (exactly 1 finite logit, the no no-op clone)");
     }
 }

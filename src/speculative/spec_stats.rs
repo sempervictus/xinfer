@@ -24,6 +24,12 @@ pub struct SpecCounters {
     pub grammar_bound: usize,
     pub target_bound: usize,
     pub ff_continuations: usize,
+    /// The total ff tokens the grammar DRAFTED (forced) across steps, before the
+    /// KV-back check. `ff_continuations` is the ACCEPTED subset (the ff runs that
+    /// survived the KV-back check + were committed). The drafted-vs-accepted split is
+    /// the FF analog of the spec `proposed`/`accepted` (the ff "draft" is the forced
+    /// run; the "accept" is the run that made it through the KV-back gate).
+    pub ff_drafted: usize,
     /// The per-position acceptance vector (the K-th position's acceptance count
     /// across steps). A K=4 draft with 2 accepted contributes `[1,1,0,0]`.
     pub accepted_per_pos: Vec<usize>,
@@ -187,10 +193,12 @@ pub fn spec_stats_update(name: &str, seq_id: usize, res: &MtpVerifyResult) {
 
 /// Record a speculative fast-forward continuation (the grammar-forced ff run) into the
 /// per-seq window. Unlike MTP/DFlash (which propose + verify drafts), the spec-ff path
-/// appends deterministic grammar-forced tokens, so it increments `steps` and
-/// `ff_continuations` (the number of ff tokens appended this step).
-pub fn spec_stats_update_ff(name: &str, seq_id: usize, ff_count: usize) {
-    if ff_count == 0 {
+/// appends deterministic grammar-forced tokens. The `ff_drafted` is the forced run the
+/// grammar produced this step; the `ff_accepted` is the subset that survived the KV-back
+/// check + was committed (the `ff_drafted` when the KV forward succeeded, the `0` when
+/// it failed + the run was rolled back). Mirrors the spec `proposed`/`accepted` split.
+pub fn spec_stats_update_ff(name: &str, seq_id: usize, ff_drafted: usize, ff_accepted: usize) {
+    if ff_drafted == 0 && ff_accepted == 0 {
         return;
     }
     let mut map = SPEC_SEQ_STATS.lock().expect("spec seq stats mutex poisoned");
@@ -199,7 +207,8 @@ pub fn spec_stats_update_ff(name: &str, seq_id: usize, ff_count: usize) {
         c.mechanism = name.to_string();
     }
     c.steps += 1;
-    c.ff_continuations += ff_count;
+    c.ff_drafted += ff_drafted;
+    c.ff_continuations += ff_accepted; // the accepted subset (the committed ff tokens)
 }
 
 /// Drop the per-sequence window at the sequence's end (runner-side cleanup).
@@ -221,6 +230,7 @@ pub fn spec_seq_stats_data(seq_id: usize) -> SpecSeqStatsData {
             grammar_bound: c.grammar_bound,
             target_bound: c.target_bound,
             ff_continuations: c.ff_continuations,
+            ff_drafted: c.ff_drafted,
             accepted_per_pos: c.accepted_per_pos.clone(),
             acceptance_rate: c.acceptance_rate,
             per_batch: c.per_batch.clone(),

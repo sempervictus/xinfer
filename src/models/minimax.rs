@@ -367,7 +367,7 @@ impl MiniMaxForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
         return_hidden: bool,
     ) -> Result<Tensor> {
         let seqlens = resolve_input_seqlens(input_metadata)?;
@@ -380,7 +380,7 @@ impl MiniMaxForCausalLM {
             self.config.sliding_window,
             input_metadata.is_prefill,
         );
-        let mut xs = if embeded_inputs {
+        let mut xs = if embedded_inputs {
             input_ids.to_owned()
         } else {
             self.embed_forward(input_ids)?
@@ -423,14 +423,14 @@ impl MiniMaxForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
         self.forward_inner(
             input_ids,
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
             false,
         )
     }
@@ -441,14 +441,14 @@ impl MiniMaxForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
         self.forward_inner(
             input_ids,
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
             true,
         )
     }

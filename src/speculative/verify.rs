@@ -104,6 +104,41 @@ pub fn verify_draft_rejection(
     let num_proposed = draft_tokens.len();
     let compare_len = num_proposed.min(num_positions);
 
+    // The fused GPU fast-path (the spec-reject-gpu feature, the attention-rs
+    // reject::fused_reject kernel): one launch does the min(1,p/q) accept + the
+    // Gumbel-max residual + the all-accepted bonus, replacing the host O(vocab)
+    // loop below. The CPU loop stays as the oracle + the no-feature fallback.
+    // The VOB is None here (the grammar-masked reject is wired separately).
+    #[cfg(all(feature = "cuda", feature = "spec-reject-gpu"))]
+    {
+        if num_positions > 0 {
+            let vocab = verify_probs.dim(1)?;
+            let k_max = compare_len;
+            let drafts = candle_core::Tensor::from_vec(
+                draft_tokens[..k_max].to_vec(),
+                (k_max,),
+                verify_probs.device(),
+            )?;
+            let (num_accepted, continuation) = attention_rs::reject::fused_reject(
+                verify_probs,
+                draft_probs,
+                &drafts,
+                None,
+                k_max,
+                vocab,
+                seed,
+            )?;
+            return Ok(MtpVerifyResult {
+                accepted_tokens: draft_tokens[..num_accepted as usize].to_vec(),
+                continuation_token: continuation,
+                num_accepted: num_accepted as usize,
+                num_proposed,
+                target_bound: num_proposed.saturating_sub(num_accepted as usize),
+                grammar_bound: 0,
+            });
+        }
+    }
+
     let vflat: Vec<f32> = verify_probs
         .to_dtype(candle_core::DType::F32)?
         .flatten_all()?

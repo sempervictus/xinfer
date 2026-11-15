@@ -757,7 +757,7 @@ impl Qwen3VLForConditionalGeneration {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<(Tensor, Tensor)> {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.forward_with_hidden(
@@ -765,14 +765,14 @@ impl Qwen3VLForConditionalGeneration {
                 positions,
                 kv_caches,
                 input_metadata,
-                embeded_inputs,
+                embedded_inputs,
             ),
             Qwen3TextModel::MoE35(m) => m.forward_with_hidden(
                 input_ids,
                 positions,
                 kv_caches,
                 input_metadata,
-                embeded_inputs,
+                embedded_inputs,
             ),
             _ => {
                 candle_core::bail!("forward_with_hidden only supported for Qwen3.5 text models")
@@ -787,7 +787,7 @@ impl Qwen3VLForConditionalGeneration {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
         target_layer_ids: &[usize],
     ) -> Result<(Tensor, Vec<Tensor>)> {
         match &self.text_model {
@@ -796,7 +796,7 @@ impl Qwen3VLForConditionalGeneration {
                 positions,
                 kv_caches,
                 input_metadata,
-                embeded_inputs,
+                embedded_inputs,
                 target_layer_ids,
             ),
             Qwen3TextModel::MoE35(model) => model.forward_collecting_layers(
@@ -804,7 +804,7 @@ impl Qwen3VLForConditionalGeneration {
                 positions,
                 kv_caches,
                 input_metadata,
-                embeded_inputs,
+                embedded_inputs,
                 target_layer_ids,
             ),
             _ => candle_core::bail!(

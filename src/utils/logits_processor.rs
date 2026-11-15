@@ -582,6 +582,70 @@ impl LogitsProcessor {
         Ok(next_tokens)
     }
 
+    /// Per-sequence sampling (the QoS-gated additive path): each row samples with its own
+    /// temperature / top_p / top_k (the per-batch-row tensors).
+    #[cfg(feature = "cuda")]
+    pub fn sample_with_strategy_perseq(
+        &self,
+        logits: &Tensor,
+        temperature_d: &Tensor, // [B]
+        top_p_d: &Tensor,       // [B]
+        top_k_d: &Tensor,       // [B]
+    ) -> Result<Vec<u32>> {
+        let seed = {
+            use rand::RngCore;
+            self.rng.lock().next_u64()
+        };
+        let sampler = self.fast_sampler.lock().unwrap();
+        sampler.sample_cuda_perseq(logits, temperature_d, top_p_d, top_k_d, seed)
+    }
+
+    /// Per-sequence sampling with a per-row grammar allow-mask (the QoS-gated additive
+    /// path): the temperature / top_p / top_k are per-batch-row tensors (the [B]), and
+    /// the mask is a [B, V] F32 allow-matrix (1.0 = legal, 0.0 = illegal).
+    #[cfg(feature = "cuda")]
+    pub fn sample_with_strategy_perseq_masked(
+        &self,
+        logits: &Tensor,
+        mask: &Tensor, // [B, V] F32, 1.0=legal / 0.0=illegal
+        temperature_d: &Tensor, // [B]
+        top_p_d: &Tensor,       // [B]
+        top_k_d: &Tensor,       // [B]
+    ) -> Result<Vec<u32>> {
+        let seed = {
+            use rand::RngCore;
+            self.rng.lock().next_u64()
+        };
+        let sampler = self.fast_sampler.lock().unwrap();
+        sampler.sample_cuda_perseq_masked(logits, mask, temperature_d, top_p_d, top_k_d, seed)
+    }
+
+    /// Per-sequence sampling with a compact VOB grammar bitset (`[B, V/32]` U32, the
+    /// 8x-less-data form of the F32 allow-mask): the temperature / top_p / top_k are
+    /// per-batch-row tensors (the [B], the QoS per-sequence strategy), and the mask is
+    /// the VOB bitset (bit i set = token allowed). Uses the fused
+    /// `sample_cuda_vob_perseq` kernel (the VOB bit-gate + the per-row strategy in one
+    /// kernel pair). This is the QoS contract for grammar-constrained requests: each
+    /// sequence samples with its own strategy while the grammar mask is enforced,
+    /// correct under batching / parallel decode (the [B] strategy tensors + the
+    /// [B, V/32] bitset are row-aligned).
+    #[cfg(feature = "cuda")]
+    pub fn sample_with_vob_perseq(
+        &self,
+        logits: &Tensor,
+        vob: Option<&Tensor>, // [B, V/32] U32, or None
+        temperature_d: &Tensor, // [B]
+        top_p_d: &Tensor,       // [B]
+        top_k_d: &Tensor,       // [B]
+    ) -> Result<Vec<u32>> {
+        let seed = {
+            use rand::RngCore;
+            self.rng.lock().next_u64()
+        };
+        let sampler = self.fast_sampler.lock().unwrap();
+        sampler.sample_cuda_vob_perseq(logits, vob, temperature_d, top_p_d, top_k_d, seed)
+    }
+
     /// Sample `sample_with_strategy`, but with an optional per-row grammar allow-mask
     /// (`[batch, vocab]` u8, 1 = legal) offloaded into the fused CUDA sampler's top-k
     /// stage, so disallowed vocab is dropped without a separate CPU biasing pass.

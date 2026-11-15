@@ -8,7 +8,6 @@ use crate::core::sequence::{DecodeSequence, SequenceStatus};
 use crate::core::lora::{DEFAULT_LORA_MAX_BYTES, DEFAULT_LORA_MAX_TENANTS};
 use crate::core::mem_budget::{apply_kv_cache_cap, GpuReserve, MemoryMapSet, PoolBudget};
 use crate::telemetry::Telemetry;
-use crate::utils::env::{moe_offload_auto, moe_offload_profile, qos_enabled, spec_parallel_draft};
 use crate::core::GenerationOutput;
 use crate::models::layers::distributed::Comm;
 #[cfg(feature = "nccl")]
@@ -29,10 +28,18 @@ use crate::transfer::Transfer;
 use crate::utils::chat_template::Message;
 use crate::utils::config::{EngineConfig, EosTokenId, ModelType, SamplingParams};
 use crate::utils::guidance::{build_llg_factory, extract_guidance_tokens, GuidanceTokens};
-use crate::utils::guidance_grammar::{get_reasoning_token_strings, is_reasoning_grammar};
+use crate::utils::guided_decoding::GuidedDecoding;
+use crate::utils::guidance_grammar::{get_lark_from_top_level_grammar, is_reasoning_grammar};
 use crate::utils::heartbeat::heartbeat_worker;
 use crate::utils::image::{get_image_config, ImageData, ImageProcessConfig};
+use crate::utils::loop_detect::{KickStore, LoopDetector, LoopSeqStats};
+use crate::utils::multi_node::{recv_tcp, send_tcp};
 use crate::utils::kvcache_allocator::{hybrid_mamba_graph_capture_max_batch, KVCacheAllocator};
+use crate::utils::env::{
+    anti_loop_enabled, moe_offload_auto, moe_offload_profile, qos_enabled,
+    repetition_probe_depth, spec_ff, spec_parallel_draft,
+};
+use crate::utils::is_qwen3_hybrid_arch_name;
 use crate::utils::progress::{progress_worker, ProgressReporter};
 use crate::utils::progress::{spawn_progress_thread, ProgressLike};
 use crate::utils::{chat_template::ChatTemplate, prepare_engine_config};
@@ -121,7 +128,7 @@ pub struct LLMEngine {
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
 pub guidance_tokens: GuidanceTokens,
-    /// The live physical memory map. One device map per rank plus one host map,
+/// The live physical memory map. One device map per rank plus one host map,
     /// owned by value on the engine (no internal lock, no Arc). Mutated under the
     /// engine write lock (the boot carve, the grow, the reclaim, the probe
     /// refresh). The scheduler and the QoS controller read it for the physical
@@ -131,16 +138,17 @@ pub guidance_tokens: GuidanceTokens,
     seq_spec_stats: std::sync::Mutex<HashMap<usize, SpecSeqStatsData>>,
     /// The cached CUDA graph pool usage (the current + peak bytes, the last
     /// refresh time). The graph_pool_usage is a CUDA driver call that can block
-    /// (the GPU busy), so it's cached + refreshed on (the no every scrape).
-    /// The scrape reads the cache (the immediate, the no the 25s stall).
+    /// (the GPU busy), so it's cached + refreshed periodically (the no every
+    /// scrape). The scrape reads the cache (the immediate, the no the 25s stall).
     #[cfg(all(feature = "cuda", feature = "graph"))]
     graph_pool_cache: std::sync::Mutex<(u64, u64, std::time::Instant)>,
-    /// The seqs for which `notify_runner_finished` has already run (the idempotency
-    /// guard). A normal finish fires this from two callers (the engine `finish_step`
-    /// + the server stream-end handler); without the guard the second call re-sends
-    /// `FinishDecode` on the same subprocess socket, desyncing the request/ack
-    /// framing by one message (the "Unexpected acknowledgment value" + the hang).
-    notified_seqs: HashSet<usize>,
+    // The llg anti-loop detector (the per-seq closed-loop tail) + the kick store
+    // (the active kicks) + the per-seq loop stats (the report carrier) + the
+    // transient guard-held counter. Zero-overhead when XINFER_ANTI_LOOP is off.
+    loop_detector: LoopDetector,
+    kick_store: KickStore,
+    seq_loop_stats: std::collections::HashMap<usize, LoopSeqStats>,
+    guard_step_counts: std::collections::HashMap<usize, usize>,
 }
 
 impl LLMEngine {
@@ -196,7 +204,7 @@ impl LLMEngine {
             "Only one architecture is supported at the moment!"
         );
         let arch = config.architectures.as_ref().unwrap()[0].clone();
-        if crate::utils::is_qwen3_hybrid_arch_name(arch.as_str()) {
+        if is_qwen3_hybrid_arch_name(arch.as_str()) {
             if let Some(p_cfg) = &econfig.pd_config {
                 let role = match p_cfg.role {
                     PdRole::Server => "pd-server",
@@ -751,7 +759,7 @@ let reported = match receive_local(&mut stream, false)? {
             );
         }
 
-        // Build the live physical memory map from the finalized econfig (the tier
+// Build the live physical memory map from the finalized econfig (the tier
         // sizes) plus a fresh total-VRAM probe (the driver ground truth, not the
         // boot snapshot). The map is owned by value on the engine (no internal
         // lock); it is mutated under the engine write lock (the grow, the reclaim,
@@ -907,7 +915,10 @@ let reported = match receive_local(&mut stream, false)? {
             seq_spec_stats: std::sync::Mutex::new(HashMap::new()),
             #[cfg(all(feature = "cuda", feature = "graph"))]
             graph_pool_cache: std::sync::Mutex::new((0, 0, std::time::Instant::now())),
-            notified_seqs: HashSet::new(),
+            loop_detector: LoopDetector::new(),
+            kick_store: KickStore::new(),
+            seq_loop_stats: std::collections::HashMap::new(),
+            guard_step_counts: std::collections::HashMap::new(),
         }));
 
         Self::start_engine(engine.clone());
@@ -1192,7 +1203,7 @@ let reported = match receive_local(&mut stream, false)? {
         self.stream_senders.insert(seq_id, tx);
         self.request_types.insert(seq_id, request_type.clone());
         if self.econfig.server_mode.unwrap_or(true) && request_type != RequestType::Completion {
-            log_warn!(
+            log_info!(
                 "[{:?}] New request [Seq_id {}, {} tokens] received! (session_id: {:?})\n",
                 request_type,
                 seq_id,
@@ -1227,7 +1238,7 @@ let reported = match receive_local(&mut stream, false)? {
         self.stream_senders.insert(seq_id, tx);
         self.request_types.insert(seq_id, request_type.clone());
         if self.econfig.server_mode.unwrap_or(true) && request_type != RequestType::Completion {
-            log_warn!(
+            log_info!(
                 "[{:?}] New request [Seq_id {}, {} tokens] received! (session_id: {:?})\n",
                 request_type,
                 seq_id,
@@ -1355,26 +1366,37 @@ fn take_prompt_replay_token_ids(&mut self, seq_id: usize) -> Option<Vec<u32>> {
         self.seq_prompt_replays.remove(&seq_id)
     }
 
-    pub fn notify_runner_finished(&mut self, id: usize) -> Result<()> {
-        // The idempotency guard: a normal finish fires this from two callers (the
-        // engine `finish_step` + the server stream-end handler). Only the FIRST call
-        // does the work (the `FinishDecode` send, the spec-stats capture); the second
-        // is a no-op. Without this the second call re-sends `FinishDecode` on the same
-        // subprocess socket, desyncing the request/ack framing by one message (the
-        // "Unexpected acknowledgment value" + the hang).
-        if !self.notified_seqs.insert(id) {
-            return Ok(());
-        }
-        // The capture-before-drop: pull the per-seq spec stats from the runner
-        // BEFORE the `FinishDecode` message drops them runner-side, so the
-        // server's end-of-sequence report reads a surviving in-process copy.
-        let spec_stats = spec_seq_stats_data(id);
-        if !spec_stats.mechanism.is_empty() {
-            self.seq_spec_stats.lock().unwrap().insert(id, spec_stats);
-        }
+pub fn notify_runner_finished(&mut self, id: usize) -> Result<()> {
+        // The author's singular finish path: ONE fire-and-forget `FinishDecode` per
+        // runner (the no a second, response-bearing message on the finish socket). The
+        // runner's `FinishDecode` handler is idempotent (the `spec_seq_report` drop +
+        // the `runner.finished` release, both no-ops on a repeat), so a seq notified
+        // from two callers (the engine `finish_step` + the server stream-end handler)
+        // is safe -- the second `FinishDecode` is absorbed without a response (the no a
+        // request/ack desync).
+        //
+        // The per-seq spec stats + the per-phase token tally are NOT pulled here (the
+        // prior `GetSpecSeqStats` finish-time pull was the second, response-bearing
+        // message that desynced the framing). They are cached in-process by
+        // `finish_step` from the per-step `GateCommitResponse` (the stats ride the
+        // message that already crosses the socket every decode step), so the master
+        // reads its own cache for the end-of-seq report.
         match &mut *self.runners.write() {
-            RunnerType::Thread(model_runner) => Ok(model_runner.finished(id)),
+            RunnerType::Thread(model_runner) => {
+                // The in-process Thread runner shares this process's SPEC_SEQ_STATS
+                // global, so a direct read is correct (the no a socket pull).
+                let spec_stats = spec_seq_stats_data(id);
+                if !spec_stats.mechanism.is_empty() {
+                    self.seq_spec_stats.lock().unwrap().insert(id, spec_stats);
+                }
+                return Ok(model_runner.finished(id));
+            }
             RunnerType::Process(ref mut runner_streams) => {
+                // The spec stats + phase counts are already cached in-process by
+                // `finish_step` (the per-step `GateCommitResponse`). The finish path
+                // sends ONLY the fire-and-forget `FinishDecode` (the no a second,
+                // response-bearing pull -- that second message is what desynced the
+                // request/ack framing).
                 for stream in runner_streams {
                     send_local(
                         &mut vec![stream.try_clone()?],
@@ -1382,24 +1404,30 @@ fn take_prompt_replay_token_ids(&mut self, seq_id: usize) -> Option<Vec<u32>> {
                         false,
                     )?;
                 }
-                Ok(())
+                return Ok(());
             }
             RunnerType::MultiNodeMaster {
                 ref mut local_streams,
                 ref mut remote_streams,
             } => {
+                // The spec stats + phase counts are already cached in-process by
+                // `finish_step` (the per-step `GateCommitResponse`). The finish path
+                // sends ONLY the fire-and-forget `FinishDecode` (the no a second,
+                // response-bearing pull -- that second message is what desynced the
+                // request/ack framing).
                 let msg = MessageType::FinishDecode(id);
                 for stream in local_streams.iter_mut() {
                     send_local(&mut vec![stream.try_clone()?], &msg, false)?;
                 }
                 let serialized = rmp_serde::to_vec(&msg).expect("MsgPack serialization failed");
                 for tcp_stream in remote_streams.iter_mut() {
-                    crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
+                    send_tcp(tcp_stream, &serialized)?;
                 }
-Ok(())
-}
+                return Ok(());
+            }
         }
     }
+
 
     /// The end-of-sequence scheduling report (cached tokens + QoS stats) for the
     /// server's per-sequence display. Delegates to the scheduler (same process).
@@ -1407,9 +1435,292 @@ Ok(())
         self.scheduler.get_seq_report(seq_id)
     }
 
+// The llg anti-loop methods (the get_seq_loop_stats + the observe_loop). The
+    // fetch_spec_seq_stats is dropped (the §7.3 capture-before-drop: the per-seq spec
+    // stats now come from the SchedD-owned map via GetSpecStats, the no runner fetch).
+    /// The cached per-seq loop-defense stats (for the server's end-of-sequence report).
+    pub fn get_seq_loop_stats(&self, seq_id: usize) -> Option<LoopSeqStats> {
+        self.seq_loop_stats.get(&seq_id).cloned()
+    }
+
     /// The cached per-seq spec stats (for the server's end-of-sequence report).
     pub fn get_seq_spec_stats(&self, seq_id: usize) -> Option<SpecSeqStatsData> {
         self.seq_spec_stats.lock().unwrap().get(&seq_id).cloned()
+    }
+
+    /// The llg sealed-gate: commit each produced run to the grammar FSM + keep only
+    /// the FSM-passing prefix, just before the sequence append. The `ff` selects the
+    /// spec-FF ordered-queue writer. For the IPC/multi-node transports the gate runs
+    /// on the remote runner (which owns the FSM), so this is a `GateCommit` RPC; for
+    /// the in-process Thread runner it is a direct `ModelRunner::gate_commit` call.
+    fn gate_commit(
+        runners: &Arc<RwLock<RunnerType>>,
+        seq_ids: &[usize],
+        runs: &[Vec<u32>],
+        ff: bool,
+        seq_infos: &[crate::speculative::metadata::SpecSeqInfo],
+    ) -> (Vec<Vec<u32>>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<SpecSeqStatsData>, Vec<[usize; 3]>) {
+        match &mut *runners.write() {
+            RunnerType::Thread(model_runner) => {
+                // The in-process Thread runner: the spec stats + phase counts are read
+                // directly (the no a socket round-trip).
+                let (gated, reasoning_deltas, ff_deltas, ff_drafted, mask_fail_streaks) =
+                    model_runner.gate_commit(seq_ids, runs, ff, seq_infos);
+                let spec_stats: Vec<SpecSeqStatsData> =
+                    seq_ids.iter().map(|&sid| spec_seq_stats_data(sid)).collect();
+                let phase_counts: Vec<[usize; 3]> =
+                    seq_ids.iter().map(|&sid| model_runner.phase_token_counts(sid)).collect();
+                (gated, reasoning_deltas, ff_deltas, ff_drafted, mask_fail_streaks, spec_stats, phase_counts)
+            }
+            RunnerType::Process(streams) => {
+                use crate::runner::MessageType;
+                let request = MessageType::GateCommit((seq_ids.to_vec(), runs.to_vec(), ff, seq_infos.to_vec()));
+                let cloned: Vec<_> = streams.iter_mut().map(|s| s.try_clone().expect("clone failed")).collect();
+                let all: Result<
+                    Vec<(
+                        Vec<Vec<u32>>,
+                        Vec<usize>,
+                        Vec<usize>,
+                        Vec<usize>,
+                        Vec<usize>,
+                        Vec<SpecSeqStatsData>,
+                        Vec<[usize; 3]>,
+                    )>,
+                > = cloned
+                    .into_par_iter()
+                    .map(|mut stream| {
+                        send_local(&mut vec![stream.try_clone()?], &request, false)?;
+                        match receive_local(&mut stream, false)? {
+                            MessageType::GateCommitResponse(
+                                gated,
+                                deltas,
+                                ff_deltas,
+                                ff_drafted,
+                                mask_fail_streaks,
+                                spec_stats,
+                                phase_counts,
+                            ) => Ok((
+                                gated,
+                                deltas,
+                                ff_deltas,
+                                ff_drafted,
+                                mask_fail_streaks,
+                                spec_stats,
+                                phase_counts,
+                            )),
+                            other => candle_core::bail!("Unexpected GateCommit response: {:?}", other),
+                        }
+                    })
+                    .collect();
+                match all {
+                    Ok(res) => res.into_iter().next().unwrap_or_else(|| {
+                        (
+                            runs.to_vec(),
+                            vec![0usize; seq_ids.len()],
+                            vec![0usize; seq_ids.len()],
+                            vec![0usize; seq_ids.len()],
+                            vec![0usize; seq_ids.len()],
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                    }),
+                    Err(_) => (
+                        runs.to_vec(),
+                        vec![0usize; seq_ids.len()],
+                        vec![0usize; seq_ids.len()],
+                        vec![0usize; seq_ids.len()],
+                        vec![0usize; seq_ids.len()],
+                        Vec::new(),
+                        Vec::new(),
+                    ), // the gate unavailable: pass through
+                }
+            }
+            RunnerType::MultiNodeMaster { local_streams, remote_streams } => {
+                use crate::runner::MessageType;
+                let request = MessageType::GateCommit((seq_ids.to_vec(), runs.to_vec(), ff, seq_infos.to_vec()));
+                let serialized = rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
+                let send_ok = remote_streams.iter_mut().all(|stream| {
+                    send_tcp(stream, &serialized).is_ok()
+                });
+                if !send_ok {
+                    return (
+                        runs.to_vec(),
+                        vec![0usize; seq_ids.len()],
+                        vec![0usize; seq_ids.len()],
+                        vec![0usize; seq_ids.len()],
+                        vec![0usize; seq_ids.len()],
+                        Vec::new(),
+                        Vec::new(),
+                    ); // the gate unavailable: pass through
+                }
+                let result = Self::gate_commit_local(local_streams, &request);
+                for stream in remote_streams.iter_mut() {
+                    let _ = recv_tcp(stream);
+                }
+                result
+            }
+        }
+    }
+
+    fn gate_commit_local(
+        runner_streams: &mut Vec<LocalStream>,
+        request: &MessageType,
+    ) -> (Vec<Vec<u32>>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<SpecSeqStatsData>, Vec<[usize; 3]>) {
+        use crate::runner::MessageType;
+        let cloned: Vec<LocalStream> = runner_streams.iter_mut().map(|s| s.try_clone().expect("clone failed")).collect();
+        let all: Result<
+            Vec<(
+                Vec<Vec<u32>>,
+                Vec<usize>,
+                Vec<usize>,
+                Vec<usize>,
+                Vec<usize>,
+                Vec<SpecSeqStatsData>,
+                Vec<[usize; 3]>,
+            )>,
+        > = cloned
+            .into_par_iter()
+            .map(|mut stream| {
+                send_local(&mut vec![stream.try_clone()?], request, false)?;
+                match receive_local(&mut stream, false)? {
+                    MessageType::GateCommitResponse(
+                        gated,
+                        deltas,
+                        ff_deltas,
+                        ff_drafted,
+                        mask_fail_streaks,
+                        spec_stats,
+                        phase_counts,
+                    ) => Ok((
+                        gated,
+                        deltas,
+                        ff_deltas,
+                        ff_drafted,
+                        mask_fail_streaks,
+                        spec_stats,
+                        phase_counts,
+                    )),
+                    other => candle_core::bail!("Unexpected GateCommit response: {:?}", other),
+                }
+            })
+            .collect();
+        match all {
+            Ok(res) => res.into_iter().next().unwrap_or_else(|| {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            }),
+            Err(_) => (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        }
+    }
+
+    /// The anti-loop OBSERVE: check the accepted tokens for a closed loop.
+    /// Zero-overhead when XINFER_ANTI_LOOP is off (the default).
+    fn observe_loop(&mut self, seq_id: usize, accepted: &[u32], ff_forced: usize) {
+        use crate::utils::loop_detect::LoopSeqStats;
+        let probe_depth = repetition_probe_depth();
+        let was_active = self.kick_store.is_active(seq_id);
+        // The guard duration tracking: while a kick is held, count the steps.
+        if was_active {
+            *self.guard_step_counts.entry(seq_id).or_insert(0) += 1;
+            if let Some(stats) = self.seq_loop_stats.get_mut(&seq_id) {
+                stats.guard_steps += 1;
+            }
+        }
+        match self.loop_detector.observe(seq_id, accepted, probe_depth, ff_forced) {
+            Some(span) => {
+                self.kick_store.apply(seq_id, &span);
+                let kick = self.kick_store.get(seq_id).expect("just applied");
+                let stats = self.seq_loop_stats.entry(seq_id).or_insert_with(LoopSeqStats::default);
+                stats.guards += 1;
+                if !stats.periods.contains(&span.period) {
+                    stats.periods.push(span.period);
+                }
+                crate::log_warn!(
+                    "[llg] [Seq {}] loop detected: period={} unit={:?} -> mitigation applied (exclude {} tokens)",
+                    seq_id, span.period, kick.unit, kick.unit.len()
+                );
+                // Bridge the kick to the runner (the sampling constraint). The FULL unit
+                // (the no single forbid token) -- the whole period-P cycle is excluded
+                // at the trigger position to break the loop.
+                self.send_loop_kick(seq_id, kick.unit.clone(), kick.seed.clone(), span.period);
+            }
+            None => {
+                if was_active {
+                    self.kick_store.remove(seq_id);
+                    crate::log_info!("[llg] [Seq {}] loop cleared; kick removed", seq_id);
+                    self.clear_loop_kick(seq_id);
+                }
+            }
+        }
+    }
+
+    /// Bridge the anti-loop kick to the runner's sampler (the `SetLoopKick` IPC, the
+    /// no the actor `FwdMessage::SetLoopKick`). Fire-and-forget.
+    fn send_loop_kick(&self, seq_id: usize, unit: Vec<u32>, seed: Vec<u32>, period: u32) {
+        use crate::runner::MessageType;
+        let request = MessageType::SetLoopKick((seq_id, unit, seed, period));
+        let mut result: std::result::Result<(), std::io::Error> = Ok(());
+        match &mut *self.runners.write() {
+            RunnerType::Thread(_) => {} // the in-process: the runner's kick_store is applied directly via gate_commit
+            RunnerType::Process(streams) => {
+                for stream in streams.iter_mut() {
+                    if result.is_err() { break; }
+                    result = send_local(&mut vec![stream.try_clone().expect("clone failed")], &request, false);
+                }
+            }
+            RunnerType::MultiNodeMaster { local_streams, remote_streams } => {
+                let serialized = rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
+                for stream in remote_streams.iter_mut() {
+                    if result.is_err() { break; }
+                    result = send_tcp(stream, &serialized);
+                }
+                for stream in local_streams.iter_mut() {
+                    if result.is_err() { break; }
+                    result = send_local(&mut vec![stream.try_clone().expect("clone failed")], &request, false);
+                }
+            }
+        }
+        if let Err(e) = result {
+            crate::log_error!("send_loop_kick failed: {e}");
+        }
+    }
+
+    /// Clear the anti-loop kick for a sequence (the `ClearLoopKick` IPC, the no the
+    /// actor `FwdMessage::ClearLoopKick`). Fire-and-forget.
+    fn clear_loop_kick(&self, seq_id: usize) {
+        use crate::runner::MessageType;
+        let request = MessageType::ClearLoopKick(seq_id);
+        let mut result: std::result::Result<(), std::io::Error> = Ok(());
+        match &mut *self.runners.write() {
+            RunnerType::Thread(_) => {}
+            RunnerType::Process(streams) => {
+                for stream in streams.iter_mut() {
+                    if result.is_err() { break; }
+                    result = send_local(&mut vec![stream.try_clone().expect("clone failed")], &request, false);
+                }
+            }
+            RunnerType::MultiNodeMaster { local_streams, remote_streams } => {
+                let serialized = rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
+                for stream in remote_streams.iter_mut() {
+                    if result.is_err() { break; }
+                    result = send_tcp(stream, &serialized);
+                }
+                for stream in local_streams.iter_mut() {
+                    if result.is_err() { break; }
+                    result = send_local(&mut vec![stream.try_clone().expect("clone failed")], &request, false);
+                }
+            }
+        }
+        if let Err(e) = result {
+            crate::log_error!("clear_loop_kick failed: {e}");
+        }
     }
 
     /// Release hybrid GDN/Mamba active slots queued by scheduler-side abort paths.
@@ -1505,7 +1816,7 @@ Ok(())
                 // Send to remote worker nodes via TCP (fire-and-forget the responses;
                 // NCCL all-reduce synchronizes the actual computation)
                 for tcp_stream in remote_streams.iter_mut() {
-                    if let Err(e) = crate::utils::multi_node::send_tcp(tcp_stream, &serialized) {
+                    if let Err(e) = send_tcp(tcp_stream, &serialized) {
                         candle_core::bail!("Failed to send forward to remote worker: {}", e);
                     }
                 }
@@ -1516,7 +1827,7 @@ Ok(())
 
                 // Collect acks from remote workers
                 for tcp_stream in remote_streams.iter_mut() {
-                    match crate::utils::multi_node::recv_tcp(tcp_stream) {
+                    match recv_tcp(tcp_stream) {
                         Ok(data) => {
                             let resp: MessageType = rmp_serde::from_slice(&data)
                                 .expect("Failed to deserialize remote worker response");
@@ -1665,7 +1976,7 @@ Ok(())
                     rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                 for tcp_stream in remote_streams.iter_mut() {
-                    if let Err(e) = crate::utils::multi_node::send_tcp(tcp_stream, &serialized) {
+                    if let Err(e) = send_tcp(tcp_stream, &serialized) {
                         candle_core::bail!("Failed to send MTP forward to remote worker: {}", e);
                     }
                 }
@@ -1673,7 +1984,7 @@ Ok(())
                 let result = Self::run_mtp_on_local_streams(local_streams, &request);
 
                 for tcp_stream in remote_streams.iter_mut() {
-                    let _ = crate::utils::multi_node::recv_tcp(tcp_stream);
+                    let _ = recv_tcp(tcp_stream);
                 }
 
                 result
@@ -1738,11 +2049,11 @@ Ok(())
                 let serialized =
                     rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
                 for stream in remote_streams.iter_mut() {
-                    crate::utils::multi_node::send_tcp(stream, &serialized)?;
+                    send_tcp(stream, &serialized)?;
                 }
                 let result = Self::run_dflash_on_local_streams(local_streams, &request);
                 for stream in remote_streams.iter_mut() {
-                    let _ = crate::utils::multi_node::recv_tcp(stream);
+                    let _ = recv_tcp(stream);
                 }
                 result
             }
@@ -1764,6 +2075,140 @@ Ok(())
                 multi_output_ids.len()
             );
         }
+
+        // The llg sealed-gate: commit each produced run to the grammar FSM + keep
+        // only the FSM-passing prefix, just before the sequence append. The `ff`
+        // selects the spec-FF ordered-queue writer. When guidance is inactive the
+        // gate is a pass-through (the `gated` == the raw `multi_output_ids`), so
+        // this is a no-op for unguided sequences. The anti-loop OBSERVE (the
+        // XINFER_ANTI_LOOP, default off) checks the accepted tokens for a closed loop.
+        let seq_ids: Vec<usize> = scheduled_ids
+            .iter()
+            .map(|&idx| self.scheduler.get_running(idx).map(|s| s.id).unwrap_or(idx))
+            .collect();
+        let use_spec_ff = spec_ff() && !is_prefill;
+        // The per-seq KV metadata (the `len` + the `block_table`) for the gate's
+        // KV-backed ff forward (the `run_ff_forward`). Built from the scheduler's
+        // running seqs (the `scheduled_ids` are the running indices).
+        let seq_infos: Vec<crate::speculative::metadata::SpecSeqInfo> = scheduled_ids
+            .iter()
+            .filter_map(|&idx| {
+                let seq = self.scheduler.get_running(idx)?;
+                Some(crate::speculative::metadata::SpecSeqInfo {
+                    id: seq.id,
+                    len: seq.len(),
+                    block_table: seq.block_table.clone(),
+                    k: 0, // the ff span (the no the MTP draft K, the ff reserve is separate)
+                })
+            })
+            .collect();
+        let (gated, reasoning_deltas, ff_deltas, ff_drafted, mask_fail_streaks, spec_stats, phase_counts) =
+            Self::gate_commit(&self.runners, &seq_ids, &multi_output_ids, use_spec_ff, &seq_infos);
+        // The ff-length feedback: record the per-seq drafted ff run length (the no the
+        // accepted count, the no the static reserve) so the NEXT step's pre-alloc
+        // reserves exactly the ff span (the no the under-alloc that bailed the ff
+        // forward, the no the systematic ff-drafted-but-0-accepted stat).
+        self.scheduler.record_ff_len_feedback(&seq_ids, &ff_drafted);
+        // The per-seq spec stats + phase counts ride the per-step `GateCommitResponse`
+        // (the no a separate finish-time `GetSpecSeqStats` socket pull, which desynced
+        // the finish path). Cache them in-process each step; the end-of-seq report reads
+        // the master's own cache (the author's master-side-stats pattern).
+        for (i, &seq_id) in seq_ids.iter().enumerate() {
+            if let Some(data) = spec_stats.get(i) {
+                if !data.mechanism.is_empty() {
+                    self.seq_spec_stats.lock().unwrap().insert(seq_id, data.clone());
+                }
+            }
+            if let Some(counts) = phase_counts.get(i) {
+                if let Some(seq) = self.scheduler.get_by_id_mut(seq_id) {
+                    seq.sched_stats.reasoning_tokens = counts[0];
+                    seq.sched_stats.text_tokens = counts[1];
+                    seq.sched_stats.tool_call_tokens = counts[2];
+                }
+            }
+        }
+        // The reasoning counter: increment the engine-owned Sequence's
+        // reasoning_token_count by the per-seq delta (the tokens committed while in
+        // the Reasoning phase this step). The runner reads this from the Sequence
+        // clone (the no the optional GuidanceState, which is not populated on the
+        // MTP/spec-decode path).
+        for (i, &seq_id) in seq_ids.iter().enumerate() {
+            if let Some(delta) = reasoning_deltas.get(i) {
+                if *delta > 0 {
+                    if let Some(seq) = self.scheduler.get_by_id_mut(seq_id) {
+                        seq.reasoning_token_count += *delta;
+                    }
+                }
+            }
+            // The ff-token counter: increment the engine-owned Sequence's
+            // sched_stats.ff_continuations by the per-seq delta (the grammar-forced
+            // tokens auto-generated this step, the spec-ff path). Flows to the
+            // /metrics export + the per-seq report at sequence finish.
+            if let Some(delta) = ff_deltas.get(i) {
+                if *delta > 0 {
+                    if let Some(seq) = self.scheduler.get_by_id_mut(seq_id) {
+                        seq.sched_stats.ff_continuations += *delta;
+                    }
+                }
+            }
+        }
+        // The ff-length feedback: record the per-seq ff run length (the no the static
+        // reserve) so the NEXT step's pre-alloc allocates exactly the ff span (the no
+        // over- or under-allocation). The 0 ff run (the no the free-text position)
+        // records 0 (the no the ff span for that seq next step). Called once with the
+        // full arrays (the no per-seq, the no the loop).
+        self.scheduler.record_ff_len_feedback(&seq_ids, ff_deltas.as_slice());
+        // The anti-loop OBSERVE: check the accepted tokens for a closed loop.
+        // Zero-overhead when XINFER_ANTI_LOOP is off (the default).
+        if anti_loop_enabled() {
+            for (i, &seq_id) in seq_ids.iter().enumerate() {
+                if i < gated.len() {
+                    // The phase-aware detector: exclude the ff-forced tokens (the
+                    // grammar scaffolding, the tail of `gated[i]`) from the
+                    // periodicity probe. Only the model-sampled prefix counts as a
+                    // potential loop (the no false-positive on the tool-call literals).
+                    let ff_forced = ff_deltas.get(i).copied().unwrap_or(0);
+                    self.observe_loop(seq_id, &gated[i], ff_forced);
+                }
+            }
+        }
+        // The mask-fail re-decode bound (the no infinite stall on a terminally-stuck
+        // FSM): a seq whose mask has failed `bound` consecutive steps (the no committed
+        // progress, the position keeps re-decoding into the same broken state) is
+        // terminated gracefully (the `cancel`, the client gets a completion, the
+        // KV/mamba slot is freed). The bound is MODEL-DEPENDENT:
+        // - Hybrid-mamba (the in-place recurrent state): bound = 1. A re-decode
+        //   advances the mamba state by the rejected sentinel (the token 0), which is
+        //   NOT in the committed sequence -- the mamba state desyncs on the FIRST
+        //   re-decode (the no the idempotent KV overwrite of the paged-attention
+        //   model). So a hybrid-mamba seq terminates on the first mask failure (the no
+        //   a re-decode loop that corrupts the recurrent state).
+        // - Paged-attention (the idempotent KV): bound = 32. A re-decode overwrites
+        //   the same KV slot (the idempotent), so the seq can safely re-decode up to
+        //   32 times before the terminally-stuck FSM is terminated.
+        // This prevents one pathological grammar from starving the multi-user pool
+        // (the self-DoS vector). The streak rides the `GateCommitResponse` IPC (the no
+        // a Thread-only check, production is all IPC on CUDA).
+        let is_hybrid_mamba = matches!(
+            self.model_type,
+            ModelType::Qwen3_5 | ModelType::Qwen3_5MoE | ModelType::Qwen4 | ModelType::Qwen3VL
+        );
+        let mask_fail_bound = if is_hybrid_mamba { 1 } else { GuidedDecoding::MAX_MASK_FAIL_STREAK };
+        for (i, &seq_id) in seq_ids.iter().enumerate() {
+            let streak = mask_fail_streaks.get(i).copied().unwrap_or(0);
+            if streak >= mask_fail_bound {
+                crate::log_error!(
+                    "[llg] seq {seq_id}: grammar mask failed {} consecutive steps (the re-decode bound {} for model {:?}); terminating the sequence gracefully (the no livelock, the no pool starvation, the no the mamba-state desync)",
+                    streak, mask_fail_bound, self.model_type
+                );
+                self.cancel(seq_id);
+            }
+        }
+        // The SEAL: the append consumes the `gated` (the FSM-legal prefix from the
+        // single `gate_commit`), never the raw `multi_output_ids`. When guidance is
+        // inactive the `gated` == the raw (the fail-open), so this is a no-op for
+        // unguided sequences.
+        let multi_output_ids = gated;
 
         // `scheduled_ids` are indexes into scheduler.running, while
         // `multi_output_ids` is dense and ordered by position in scheduled_ids.
@@ -1896,9 +2341,6 @@ Ok(())
                     self.seq_prefilled_reasoning_end.remove(&seq_id);
                     self.seq_prompt_replays.remove(&seq_id);
                     let _ = self.notify_runner_finished(seq_id);
-                    // Prune the idempotency guard (the seq is fully cleaned up now, the
-                    // no an unbounded `notified_seqs` growth under long-running service).
-                    self.notified_seqs.remove(&seq_id);
                     if self.econfig.server_mode.unwrap_or(true) {
                         self.scheduler.print_free_blocks();
                     }
@@ -2040,8 +2482,6 @@ Ok(())
                 self.scheduler.cancel(seq_id);
                 // Ensure model-side per-sequence state (e.g., Qwen3.5 Mamba cache slot) is released.
                 let _ = self.notify_runner_finished(seq_id);
-                // Prune the idempotency guard (the seq is fully cleaned up now).
-                self.notified_seqs.remove(&seq_id);
                 if let Some(_) = self.active_requests.get(&seq_id) {
                     self.active_requests.remove(&seq_id);
                 }
@@ -2186,7 +2626,8 @@ Ok(())
         }
         // Generation alignment and open/close parity enforcement
         if let Some(grammar) = &params.grammar {
-            if self.guidance_tokens.add_bos_token {
+            let lark = get_lark_from_top_level_grammar(grammar);
+            if lark.contains("start: bos ") {
                 // BOS-based trimming: trim the last BOS token from the prompt tail.
                 // Only trim if the prompt actually ends with the BOS string to avoid
                 // splitting in the middle of a multi-turn conversation.
@@ -2209,33 +2650,9 @@ Ok(())
                         }
                     }
                 }
-            } else {
-                // Reasoning tag-based trimming: check for reasoning start/end tokens
-                if let Some((start_str, end_str)) =
-                    get_reasoning_token_strings(&self.guidance_tokens, &self.tokenizer)
-                {
-                    if is_reasoning_grammar(&grammar) {
-                        // Control entire reasoning block via guidance
-                        if prompt.trim().ends_with(&start_str) || prompt.trim().ends_with(&end_str)
-                        {
-                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx);
-                            }
-                        }
-                    } else if params.guidance_reasoning_end_ids.is_empty() {
-                        // Only trim <think> when NOT using two-phase reasoning.
-                        // With two-phase reasoning, the model needs the <think> prefix
-                        // to generate reasoning freely before grammar constraints kick in.
-                        if prompt.trim().ends_with(&start_str) {
-                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx);
-                            }
-                        }
-                    }
-                }
             }
         }
-        (prompt, image_idx)
+(prompt, image_idx)
     }
 
     pub fn is_idle(&self) -> bool {
@@ -2661,7 +3078,7 @@ Ok(())
                             rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                         for tcp_stream in remote_streams.iter_mut() {
-                            crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
+                            send_tcp(tcp_stream, &serialized)?;
                         }
 
                         let cloned_streams: Vec<LocalStream> = runner_streams
@@ -2693,7 +3110,7 @@ Ok(())
                         let all_outputs = all_outputs.map_err(candle_core::Error::wrap);
 
                         for tcp_stream in remote_streams.iter_mut() {
-                            let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
+                            let data = recv_tcp(tcp_stream)?;
                             let response: MessageType = rmp_serde::from_slice(&data)
                                 .expect("Failed to deserialize remote worker response");
                             match response {
@@ -2855,10 +3272,10 @@ pub fn start_engine(engine: Arc<RwLock<Self>>) {
                     // yet) or disabled, the static flags stand (the prior behavior). The kind 2
                     // (the chained) has no dedicated path on this branch (the chain seam is the
                     // llg work), so it falls back to the DFlash (the higher-acceptance drafter).
-                    let preferred = preferred_drafter();
+let preferred = preferred_drafter();
                     let prefer_dflash = matches!(preferred, Some(1) | Some(2));
                     let prefer_mtp = matches!(preferred, Some(0));
-// The MTP + DFlash paths both batch natively (the run_mtp_decode_batch /
+                    // The MTP + DFlash paths both batch natively (the run_mtp_decode_batch /
                     // the run_dflash_decode_batch).
                     // The shared speculative-draft slot cap (the MTP + DFlash parity):
                     // both drafters batch up to spec_parallel_draft() sequences (the
@@ -2875,7 +3292,20 @@ pub fn start_engine(engine: Arc<RwLock<Self>>) {
                     let dflash_ok = owned_seqs.len() <= spec_slots;
                     let use_dflash = dflash_enabled && !is_prefill && dflash_ok
                         && (!prefer_mtp || preferred.is_none());
-                    let mtp_ok = owned_seqs.len() <= spec_slots;
+                    // The MTP dispatch cap (the F-LLG-1 fix): the GDN MTP verify buffers
+                    // were sized at model build to the PLACEHOLDER max_num_seqs
+                    // (config.rs), NOT the final accommodating value the MMU raises it to.
+                    // Capping the MTP dispatch batch to that placeholder keeps the verify
+                    // batch (num_seqs × (K+1)) within the buffer (max_num_parallel_reqs × (spec_tokens+1)),
+                    // making the `narrow` OOB structurally impossible. The DFlash path is
+                    // capped separately by spec_parallel_draft() (the dflash_ok above).
+// The cap keys off `max_num_parallel_reqs` (the MMU-finalized parallelism,
+                    // the same quantity the GDN M sized the verify buffers to,
+                    // runner.rs), NOT `max_num_seqs` (the CLI placeholder), so the
+                    // dispatch cap and the buffer always agree.
+                    let mtp_batch_cap = engine.read().econfig.max_num_parallel_reqs.max(1);
+                    let mtp_ok = owned_seqs.len() <= spec_slots
+                        && owned_seqs.len() <= mtp_batch_cap;
                     let use_mtp = mtp_enabled && !use_dflash && !is_prefill && mtp_ok
                         && (!prefer_dflash || preferred.is_none());
 
@@ -2958,6 +3388,38 @@ mod tests {
     use super::LLMEngine;
     use crate::utils::guidance::GuidanceTokens;
 
+    // The ff fast-forward is now KV-backed (the gate's `run_ff_forward` writes the ff
+    // span's KV before committing the ff run, the no the un-backed desync that wedged
+    // tool-call generation). The ff literals are appended to the Sequence in one step
+    // (the batched ff, the "for free" CPU-side extraction) + the KV is allocated (the
+    // scheduler's `pre_allocate_ff_blocks`) + freed (the next step's `may_append`
+    // reconciliation, the unused reserve). The ff is gated on `spec_ff() && !is_prefill`
+    // (the env + the decode phase), inlined in `finish_step` (the no a separate seam).
+    #[test]
+    fn ff_prealloc_reserves_the_ff_span() {
+        // The `pre_allocate_ff_blocks` reserves the per-seq learned ff length past the
+        // base (the seq.len + 1 + ff_len), so the ff forward (the `run_ff_forward`) has
+        // KV room. The ff_len is the previous step's actual ff run (the runner feedback,
+        // not a static reserve); the floor is the FF_RESERVE_DEFAULT (the first step
+        // with no history). This test verifies the reserve math with a given ff_len
+        // (not a full scheduler instance, which is heavy).
+        let ff_len: usize = 12; // the learned ff run length (not the static 32)
+        let seq_len: usize = 100;
+        let block_size: usize = 16;
+        // The needed length: the base (seq_len) + the ff span (1 + ff_len).
+        let needed_len = seq_len + 1 + ff_len;
+        let needed_blocks = needed_len.div_ceil(block_size);
+        // The prior block count (the seq at seq_len, the no the ff span yet).
+        let prior_blocks = seq_len.div_ceil(block_size);
+        assert!(
+            needed_blocks > prior_blocks,
+            "the ff pre-alloc reserves more blocks than the prior (the ff span needs room): needed {needed_blocks} > prior {prior_blocks}"
+        );
+        // The reserve is the learned ff length (the no a static cap): the needed length
+        // is exactly seq_len + 1 + ff_len.
+        assert_eq!(needed_len, seq_len + 1 + ff_len, "the ff pre-alloc covers the learned ff span (the seq_len + 1 + ff_len)");
+    }
+
     #[test]
     fn trim_prompt_replay_prefix_accepts_single_reasoning_token() {
         let guidance_tokens = GuidanceTokens {
@@ -2967,7 +3429,9 @@ mod tests {
             reasoning_end_ids: vec![100],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            newline_tokens: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -2985,7 +3449,9 @@ mod tests {
             reasoning_end_ids: vec![100],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            newline_tokens: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -3003,7 +3469,9 @@ mod tests {
             reasoning_end_ids: vec![100],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            newline_tokens: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -3021,7 +3489,9 @@ mod tests {
             reasoning_end_ids: vec![100],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            newline_tokens: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -3039,7 +3509,9 @@ mod tests {
             reasoning_end_ids: vec![100],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            newline_tokens: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -3047,4 +3519,5 @@ mod tests {
             None
         );
     }
-}
+
+    }

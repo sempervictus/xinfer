@@ -7,7 +7,7 @@ use crate::server::run_server;
 use crate::transfer::{PdConfig, PdMethod, PdRole};
 use crate::utils::chat_template::Message;
 use crate::utils::config::ReasoningEffort;
-use crate::utils::config::{EngineConfig, GenerationConfig, SamplingParams};
+use crate::utils::config::{EngineConfig, GenerationConfig, LoraConfig, SamplingParams};
 use crate::utils::get_dtype;
 use llguidance::api::TopLevelGrammar;
 use parking_lot::RwLock;
@@ -309,8 +309,8 @@ impl EngineConfig {
         pd_server_prefix_cache_ratio=None, pd_client_prefix_cache_ratio=None, yarn_scaling_factor=None,
         disable_reasoning=false, disable_cuda_graph=false, prefill_chunk_size=Some(8192),
         num_nodes=1, node_rank=0, master_addr=None, master_port=29500,
-enable_tool_grammar=false, num_speculative_tokens=None,
-         draft_model=None, lora=None,))]
+        enable_tool_grammar=false, num_speculative_tokens=None,
+        draft_model=None, reasoning_grammars=None, lora=None,))]
     pub fn from_args(
         model_id: Option<String>,
         weight_path: Option<String>,
@@ -352,6 +352,8 @@ enable_tool_grammar=false, num_speculative_tokens=None,
         enable_tool_grammar: bool,
         num_speculative_tokens: Option<usize>,
         draft_model: Option<String>,
+        reasoning_grammars: Option<String>,
+        lora: Option<LoraConfig>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -411,12 +413,13 @@ enable_tool_grammar=false, num_speculative_tokens=None,
             num_nodes,
             node_rank,
             master_addr,
-            master_port,
+master_port,
             num_speculative_tokens,
             draft_model,
             lora: lora.unwrap_or_default(),
             enable_tool_grammar,
             qos: QosConfig::default(),
+            reasoning_grammars,
         }
     }
 }
@@ -462,6 +465,13 @@ impl SamplingParams {
             grammar,
             reasoning_effort: None,
             guidance_reasoning_end_ids: Vec::new(),
+            guidance_reasoning_start_ids: Vec::new(),
+            guidance_tool_call_start_ids: Vec::new(),
+            guidance_tool_call_end_ids: Vec::new(),
+            guidance_newline_tokens: Vec::new(),
+            reasoning_budget: None,
+            lora_tenant: None,
+            lora_tenants: Vec::new(),
         }
     }
 
@@ -484,6 +494,13 @@ impl SamplingParams {
             grammar: None,
             reasoning_effort: None,
             guidance_reasoning_end_ids: Vec::new(),
+            guidance_reasoning_start_ids: Vec::new(),
+            guidance_tool_call_start_ids: Vec::new(),
+            guidance_tool_call_end_ids: Vec::new(),
+            guidance_newline_tokens: Vec::new(),
+            reasoning_budget: None,
+            lora_tenant: None,
+            lora_tenants: Vec::new(),
         }
     }
 

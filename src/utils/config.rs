@@ -6,8 +6,6 @@ use llguidance::api::TopLevelGrammar;
 use pyo3::pyclass;
 #[cfg(feature = "python")]
 use pyo3::pymethods;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
 use serde::de::value::SeqAccessDeserializer;
 use serde::de::{Deserializer, Visitor};
 use serde::ser::Error as _;
@@ -498,6 +496,10 @@ impl LoraConfig {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EngineConfig {
     pub model_id: Option<String>,
+    /// Path to a user-defined reasoning-grammar YAML file (the levels map to inner
+    /// Lark expressions). Loaded into the global registry at startup.
+    #[serde(default)]
+    pub reasoning_grammars: Option<String>,
     pub weight_path: Option<String>,
     pub weight_file: Option<String>,
     pub enforce_parser: Option<String>,
@@ -592,6 +594,10 @@ fn default_master_port() -> u16 {
 pub struct EngineConfig {
     #[pyo3(get, set)]
     pub model_id: Option<String>,
+    /// Path to a user-defined reasoning-grammar YAML file.
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub reasoning_grammars: Option<String>,
     #[pyo3(get, set)]
     pub weight_path: Option<String>,
     #[pyo3(get, set)]
@@ -724,6 +730,7 @@ impl EngineConfig {
 impl EngineConfig {
     pub fn new(
         model_id: Option<String>,
+        reasoning_grammars: Option<String>,
         weight_path: Option<String>,
         weight_file: Option<String>,
         hf_token: Option<String>,
@@ -772,6 +779,7 @@ impl EngineConfig {
 
         Self {
             model_id,
+            reasoning_grammars,
             weight_path,
             weight_file,
             hf_token,
@@ -925,6 +933,32 @@ pub struct SamplingParams {
     /// When set, grammar constraints are deferred until after reasoning ends.
     #[serde(default)]
     pub guidance_reasoning_end_ids: Vec<u32>,
+    /// Token IDs marking start of reasoning. Drives the `OutputPhase` machine
+    /// (the `Reasoning` region entry).
+    #[serde(default)]
+    pub guidance_reasoning_start_ids: Vec<u32>,
+    /// Token IDs marking the start of a tool call (the BOT). Drives the
+    /// `Text -> ToolCall` phase transition.
+    #[serde(default)]
+    pub guidance_tool_call_start_ids: Vec<u32>,
+    /// Token IDs marking the end of a tool call (the EOT). Drives the
+    /// `ToolCall -> Text` phase transition.
+    #[serde(default)]
+    pub guidance_tool_call_end_ids: Vec<u32>,
+    /// The newline token id(s) (the `"\n"` encoding). Used to build the
+    /// reasoning terminator run (`newline + EOR + newline`) that the gate
+    /// force-injects when the reasoning budget is exhausted.
+    #[serde(default)]
+    pub guidance_newline_tokens: Vec<u32>,
+    /// The reasoning token budget (the max reasoning tokens before the model is
+    /// steered to the end-of-reasoning token). When set, the runner applies a
+    /// sampling bias to the end-of-reasoning token that ramps up as the
+    /// reasoning count approaches this budget (the smooth transition, not the
+    /// hard grammar cutoff). The `None` means no budget (the unbounded
+    /// reasoning, the prior behavior). This works with or without a grammar
+    /// (the bias is a sampling intervention, not a mask).
+    #[serde(default)]
+    pub reasoning_budget: Option<usize>,
     /// The LoRA tenant id (the per-request adapter selection). When set, the
     /// runner activates this tenant's LoRA adapters for the forward pass (the
     /// `set_active_tenant`). The `None` means the base model (no adapter).
@@ -987,6 +1021,48 @@ pub struct SamplingParams {
     /// When set, grammar constraints are deferred until after reasoning ends.
     #[serde(default)]
     pub guidance_reasoning_end_ids: Vec<u32>,
+    /// The reasoning start-marker token IDs (the region the reasoning budget
+    /// counts from).
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub guidance_reasoning_start_ids: Vec<u32>,
+    /// Token IDs marking the start of a tool call (the BOT). Drives the
+    /// `Text -> ToolCall` phase transition.
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub guidance_tool_call_start_ids: Vec<u32>,
+    /// Token IDs marking the end of a tool call (the EOT). Drives the
+    /// `ToolCall -> Text` phase transition.
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub guidance_tool_call_end_ids: Vec<u32>,
+    /// The newline token id(s) (the `"\n"` encoding). Used to build the
+    /// reasoning terminator run (`newline + EOR + newline`) that the gate
+    /// force-injects when the reasoning budget is exhausted.
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub guidance_newline_tokens: Vec<u32>,
+    /// The reasoning token budget (the max reasoning tokens before the model is
+    /// steered to the end-of-reasoning token). When set, the runner applies a
+    /// sampling bias to the end-of-reasoning token that ramps up as the
+    /// reasoning count approaches this budget. The `None` means no budget (the
+    /// unbounded reasoning, the prior behavior).
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub reasoning_budget: Option<usize>,
+    /// The LoRA tenant id (the per-request adapter selection). When set, the
+    /// runner activates this tenant's LoRA adapters for the forward pass. The
+    /// `None` means the base model (no adapter).
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub lora_tenant: Option<String>,
+    /// The LoRA tenant stack (the additive multi-adapter composition). When
+    /// non-empty, the runner composes all listed tenants' deltas additively.
+    /// This takes precedence over the single `lora_tenant`. The empty means no
+    /// stack (the single-tenant or base-model path).
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub lora_tenants: Vec<String>,
 }
 
 #[cfg(not(feature = "python"))]
@@ -1020,6 +1096,11 @@ impl SamplingParams {
             grammar_json: None,
             reasoning_effort,
             guidance_reasoning_end_ids: Vec::new(),
+            guidance_reasoning_start_ids: Vec::new(),
+            guidance_tool_call_start_ids: Vec::new(),
+            guidance_tool_call_end_ids: Vec::new(),
+            guidance_newline_tokens: Vec::new(),
+            reasoning_budget: None,
             lora_tenant: None,
             lora_tenants: Vec::new(),
         }
@@ -1043,6 +1124,11 @@ impl SamplingParams {
             grammar_json: None,
             reasoning_effort: None,
             guidance_reasoning_end_ids: Vec::new(),
+            guidance_reasoning_start_ids: Vec::new(),
+            guidance_tool_call_start_ids: Vec::new(),
+            guidance_tool_call_end_ids: Vec::new(),
+            guidance_newline_tokens: Vec::new(),
+            reasoning_budget: None,
             lora_tenant: None,
             lora_tenants: Vec::new(),
         }
@@ -1068,6 +1154,11 @@ impl Default for SamplingParams {
             grammar_json: None,
             reasoning_effort: None,
             guidance_reasoning_end_ids: Vec::new(),
+            guidance_reasoning_start_ids: Vec::new(),
+            guidance_tool_call_start_ids: Vec::new(),
+            guidance_tool_call_end_ids: Vec::new(),
+            guidance_newline_tokens: Vec::new(),
+            reasoning_budget: None,
             lora_tenant: None,
             lora_tenants: Vec::new(),
         }

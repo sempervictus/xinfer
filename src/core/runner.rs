@@ -12,9 +12,9 @@ use crate::core::lora::{
     LoraRegistry, DEFAULT_LORA_MAX_BYTES,
 };
 use crate::core::mem_budget::{apply_kv_cache_cap, GpuReserve, PoolBudget};
-use crate::utils::env::{moe_offload_auto, spec_parallel_draft};
 use crate::models::layers::moe_offload::budget::grow_to_budget;
 use crate::speculative::{DFlashDrafter, uses_dflash, uses_builtin_mtp};
+use crate::speculative::metadata::SpecSeqInfo;
 use crate::speculative::dflash::init_dflash_drafter;
 use crate::speculative::spec_stats::spec_stats_update_ff;
 use crate::server::EmbeddingStrategy;
@@ -25,6 +25,22 @@ use crate::utils::graph::{
 };
 use crate::utils::guidance::ParserFactory;
 use crate::utils::guided_decoding::{GuidedDecoding, GuidedDecodingRequest};
+use crate::utils::loop_detect::KickStore;
+use crate::utils::KvCacheBackend;
+use attention_rs::{
+    reset_paged_attention_layer_counter, get_turboquant_mode, TurboquantMode,
+    with_turboquant_layer,
+};
+#[cfg(feature = "flashinfer")]
+use attention_rs::has_flashinfer_fp8_e4m3;
+#[cfg(all(feature = "flashattn", not(feature = "flashinfer")))]
+use attention_rs::cuda_utils::sm_version;
+#[cfg(feature = "flashinfer")]
+use attention_rs::flashinfer::{decode_plan, prefill_plan};
+#[cfg(feature = "flashinfer")]
+use attention_rs::mla::{mla_decode_plan, mla_prefill_plan};
+use crate::utils::env::{debug_llg, max_reasoning_tokens, moe_offload_auto, qos_enabled, spec_mask_offload, spec_parallel_draft, vob_sampling};
+use crate::utils::kvcache_allocator::KVCacheAllocation;
 use crate::utils::image::compute_image_slice;
 use crate::utils::logits_processor::{LogitsProcessor, Sampling};
 use crate::utils::progress::ProgressLike;
@@ -62,7 +78,7 @@ use interprocess::local_socket::Stream as LocalStream;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 /// Cached sampling parameters computed once during prefill, reused during decode
 #[derive(Clone, Debug)]
@@ -97,10 +113,50 @@ fn guided_decoding_requests<'a>(
             GuidedDecodingRequest {
                 seq_id: *seq_id,
                 grammar: sampling_params.grammar.as_ref(),
+                reasoning_start_ids: &sampling_params.guidance_reasoning_start_ids,
                 reasoning_end_ids: &sampling_params.guidance_reasoning_end_ids,
+                tool_call_start_ids: &sampling_params.guidance_tool_call_start_ids,
+                tool_call_end_ids: &sampling_params.guidance_tool_call_end_ids,
+                newline_tokens: &sampling_params.guidance_newline_tokens,
+                reasoning_budget: sampling_params.reasoning_budget,
             }
         })
         .collect()
+}
+
+/// The reasoning-budget promotion bias (the pure ramp function, the testable
+/// core of the `apply_reasoning_bias`). Given the reasoning token `count` + the
+/// `budget`, returns the logit addend for the end-of-reasoning token:
+/// - 0.0 when `count > budget / 4` (the budget is far, no steering)
+/// - a quadratic ramp from 0 to 10.0 as `count` goes from `budget - budget/4`
+///   to `budget` (the smooth transition)
+/// - 10.0 when `count >= budget` (the budget exhausted, force the end token)
+/// The `10.0` is a strong but not infinite push (the model can still override
+/// with a sufficiently high logit for a non-end token); the `budget / 4`
+/// threshold means the ramp starts at the last quarter of the budget.
+fn reasoning_bias_value(count: usize, budget: usize) -> f32 {
+    if budget == 0 {
+        return 0.0; // no budget (no steering)
+    }
+    let remaining = budget.saturating_sub(count);
+    let threshold = budget / 4; // the ramp starts at the last quarter of the budget
+    if remaining == 0 {
+        10.0 // the budget exhausted, force the end token
+    } else if remaining <= threshold {
+        // The quadratic ramp: 0 at `remaining == threshold`, 10.0 at `remaining == 1`.
+        let t = (threshold - remaining) as f32 / (threshold - 1).max(1) as f32;
+        10.0 * t * t
+    } else {
+        0.0 // the budget is far, no steering
+    }
+}
+
+/// Whether the reasoning budget is exhausted (the count has reached or passed the
+/// budget). When true, the end-of-reasoning token is HARD-FORCED (all other
+/// tokens are masked out), not just biased. This is the guarantee that the
+/// reasoning region terminates at the budget regardless of the model's logits.
+pub(crate) fn reasoning_budget_exhausted(count: usize, budget: usize) -> bool {
+    budget > 0 && count >= budget
 }
 
 pub enum Model {
@@ -133,7 +189,7 @@ impl Model {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
         target_layer_ids: &[usize],
     ) -> Result<(Tensor, Vec<Tensor>)> {
         match self {
@@ -142,7 +198,7 @@ impl Model {
                 positions,
                 kv_caches,
                 input_metadata,
-                embeded_inputs,
+                embedded_inputs,
                 target_layer_ids,
             ),
             Model::Qwen3_5MoE(m) => m.forward_collecting_layers(
@@ -150,7 +206,7 @@ impl Model {
                 positions,
                 kv_caches,
                 input_metadata,
-                embeded_inputs,
+                embedded_inputs,
                 target_layer_ids,
             ),
             Model::Qwen4(m) => m.forward_collecting_layers(
@@ -158,7 +214,7 @@ impl Model {
                 positions,
                 kv_caches,
                 input_metadata,
-                embeded_inputs,
+                embedded_inputs,
                 target_layer_ids,
             ),
             Model::Qwen3VL(m) => m.forward_collecting_layers(
@@ -166,7 +222,7 @@ impl Model {
                 positions,
                 kv_caches,
                 input_metadata,
-                embeded_inputs,
+                embedded_inputs,
                 target_layer_ids,
             ),
             _ => candle_core::bail!(
@@ -234,7 +290,7 @@ pub struct ModelRunner {
     /// The `Mutex` allows the on-demand load (the `ensure_tenant_loaded`, the
     /// write path) to mutate the registry; the read path (the `apply_lora_delta`)
     /// locks it briefly.
-    pub(crate) lora_registry: Arc<Mutex<LoraRegistry>>,
+pub(crate) lora_registry: Arc<Mutex<LoraRegistry>>,
     /// The per-tenant decode graph capturers (the LoRA + the CUDA graph). Each
     /// loaded LoRA tenant gets its own captured decode graph (the base model +
     /// that tenant's delta baked in at capture time), so a graph-replayed decode
@@ -251,13 +307,20 @@ pub struct ModelRunner {
     graph_capture_max_num_seqs: usize,
     /// The model's hidden size (the `Config.hidden_size`), stored for the per-tenant
     /// graph capture (the `GraphCapturer::new` needs it). The `EngineConfig` does not
-    /// carry the hidden size, so it is stored separately from the model `.
+    /// carry the hidden size, so it is stored separately from the model config.
     #[cfg(all(feature = "cuda", feature = "graph"))]
     graph_hidden_size: usize,
+    /// The per-seq anti-loop kicks (the sampling constraint, bridged from the engine).
+    kick_store: parking_lot::RwLock<KickStore>,
 }
 
 impl ModelRunner {
     // Mamba slots track concurrent sequence states (not KV token blocks).
+
+    /// The guidance state (the grammar mask + the draft-position projection).
+    pub(crate) fn guided_decoding(&self) -> &GuidedDecoding {
+        &self.guided_decoding
+    }
 
     pub(crate) fn is_mla_model(&self) -> bool {
         // Classical MLA only (FlashInfer MLA plans). DeepSeek V4 is a separate
@@ -269,13 +332,13 @@ impl ModelRunner {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn kv_backend(&self) -> crate::utils::KvCacheBackend {
+    pub(crate) fn kv_backend(&self) -> KvCacheBackend {
         match self.model_type {
-            ModelType::DeepSeekV4 => crate::utils::KvCacheBackend::DeepSeekV4,
+            ModelType::DeepSeekV4 => KvCacheBackend::DeepSeekV4,
             ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5 => {
-                crate::utils::KvCacheBackend::Mla
+                KvCacheBackend::Mla
             }
-            _ => crate::utils::KvCacheBackend::Flash,
+            _ => KvCacheBackend::Flash,
         }
     }
 
@@ -417,14 +480,6 @@ impl ModelRunner {
         self.cached_sampling.read().clone()
     }
 
-    /// The grammar-guided decoding state (the per-seq `GuidanceState` map). Exposed
-    /// so the speculative verify paths (the mtp.rs / the dflash.rs, the separate
-    /// `crate::speculative` module) can build the per-verify-row grammar masks
-    /// (the `project_verify_masks`) without reaching into the private field.
-    pub(crate) fn guided_decoding(&self) -> &GuidedDecoding {
-        &self.guided_decoding
-    }
-
     /// Whether this runner is the rank-0 shard (the authoritative NCCL all-reduce
     /// makes all ranks agree, so rank-0 logs are the single source of truth).
     pub(crate) fn is_first_rank(&self) -> bool {
@@ -440,7 +495,7 @@ impl ModelRunner {
     }
 
     #[cfg(feature = "flashinfer")]
-    pub(crate) fn flashinfer_kv_params(&self) -> Option<crate::utils::FlashInferKvParams> {
+    pub(crate) fn flashinfer_kv_params(&self) -> Option<FlashInferKvParams> {
         self.flashinfer_kv_params
     }
 
@@ -537,7 +592,7 @@ impl ModelRunner {
         llg_factory: Option<Arc<ParserFactory>>,
         stream: Option<LocalStream>,
     ) -> Result<Self> {
-        attention_rs::reset_paged_attention_layer_counter();
+        reset_paged_attention_layer_counter();
         let requested_num_speculative = econfig.num_speculative_tokens.unwrap_or(0);
         let uses_dflash = uses_dflash(econfig);
         let uses_builtin_mtp = uses_builtin_mtp(econfig) && !uses_dflash;
@@ -781,7 +836,7 @@ match allocator.plan(&device_ids, econfig) {
         // bounds divergence).
         apply_kv_cache_cap(&budget, econfig);
 
-        let allocation = crate::utils::kvcache_allocator::KVCacheAllocation {
+        let allocation = KVCacheAllocation {
             num_gpu_blocks: econfig.num_blocks,
             #[cfg(feature = "cuda")]
             num_cpu_blocks: (econfig.num_blocks as f32 * econfig.cpu_mem_fold.unwrap_or(0.5))
@@ -1026,7 +1081,7 @@ match allocator.plan(&device_ids, econfig) {
                 let sm = device
                     .as_cuda_device()
                     .ok()
-                    .and_then(|d| attention_rs::cuda_utils::sm_version(d))
+                    .and_then(|d| sm_version(d))
                     .unwrap_or(0);
                 sm == 90 // FP8 requires SM90
             } else {
@@ -1061,7 +1116,7 @@ match allocator.plan(&device_ids, econfig) {
                 if requested_num_speculative == 0 {
                     (None, 0)
                 } else if builtin_mtp_enabled {
-                    match crate::models::qwen3_5_mtp::Qwen3_5MtpHead::new(
+                    match Qwen3_5MtpHead::new(
                         vb,
                         comm.clone(),
                         config,
@@ -1150,7 +1205,7 @@ match allocator.plan(&device_ids, econfig) {
         // still available). Empty when no adapter is configured (the prior operation).
         // The `Mutex` allows the on-demand load (the ensure_tenant_loaded) to mutate
         // the registry; the read path locks it briefly.
-        let lora_registry = std::sync::Arc::new(std::sync::Mutex::new(
+        let lora_registry = Arc::new(Mutex::new(
             init_lora_registry(econfig, &device, dtype, Some(lora_bank_cap as u64))?,
         ));
         // Set the process-wide registry (the wrapped linears consult it during
@@ -1206,7 +1261,7 @@ match allocator.plan(&device_ids, econfig) {
             cached_sampling: RwLock::new(None),
             seq_tokens: RwLock::new(HashMap::new()),
             restored_prefix_sequences: RwLock::new(HashSet::new()),
-            guided_decoding: GuidedDecoding::new(llg_factory),
+            guided_decoding: GuidedDecoding::new(llg_factory, comm.rank() == 0),
             transfer,
             is_first_rank: comm.rank() == 0,
             model_type,
@@ -1220,6 +1275,7 @@ match allocator.plan(&device_ids, econfig) {
             graph_capture_max_num_seqs,
             #[cfg(all(feature = "cuda", feature = "graph"))]
             graph_hidden_size: config.hidden_size,
+            kick_store: parking_lot::RwLock::new(KickStore::new()),
         })
     }
 
@@ -1348,32 +1404,492 @@ match allocator.plan(&device_ids, econfig) {
         }
     }
 
-    /// Speculative fast-forward decode: sample the base token (the current `run`, which
-    /// commits it to the FSM), then append the full grammar-forced (ff) run that follows.
-    /// The ff tokens are deterministic (forced by the grammar), so they are committed
-    /// directly without model sampling. Returns `[base_token, ff_run...]` per sequence;
-    /// the next draft anchors on the last ff token.
+/// Speculative fast-forward decode: sample the base token (the current `run`,
+    /// which does NOT commit it — the single `gate_commit` is the only FSM
+    /// advance). Returns `[base_token]` per sequence; the grammar-forced
+    /// continuation (the ff run) is appended by the `gate_commit` (the `ff=true`
+    /// ordered-queue writer, the seal), which commits the base, reads the ff from
+    /// the post-base settled state, + commits the ff — all in acquisition order.
     pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
         let base_tokens = self.run(seqs, false)?;
-        let seq_ids: Vec<usize> = match &seqs {
-            Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
-            Seqs::DecodeVec(v) => v.iter().map(|s| s.id()).collect(),
-        };
-        let mut outputs: Vec<Vec<u32>> = Vec::with_capacity(seq_ids.len());
-        for (i, seq_id) in seq_ids.iter().enumerate() {
-            let mut out = vec![base_tokens[i]];
-            // The remaining grammar run (from the FSM state after the base token is committed).
-            let remaining_ff = self.guided_decoding.ff_tokens(*seq_id);
-            if !remaining_ff.is_empty() {
-                self.guided_decoding.commit_ff_sequence(*seq_id);
-                // Report the ff continuation in the per-seq speculative stats (the same
-                // optional end-of-sequence report as MTP/DFlash).
-                spec_stats_update_ff("SpecFF", *seq_id, remaining_ff.len());
-                out.extend(remaining_ff);
-            }
-            outputs.push(out);
-        }
+        // The base token only. The grammar-forced continuation (the ff run) is
+        // appended by the single `gate_commit` (the `ff=true` ordered-queue writer,
+        // the seal), which commits the base, reads the ff from the post-base settled
+        // state, + commits the ff — all in acquisition order. Doing it here would
+        // double-commit (the ff committed twice: once here, once in the gate).
+        let outputs: Vec<Vec<u32>> = base_tokens.iter().map(|t| vec![*t]).collect();
         Ok(outputs)
+    }
+
+/// The single ordered-queue writer: every token-production path funnels through
+    /// here, just before the sequence append, so the sequence can never hold a token
+    /// the FSM rejected.
+    ///
+    /// `ff` selects the ordered-queue writer: when true (the spec-FF path) the base
+    /// run is committed, the grammar-forced continuation is read from the settled
+    /// state, and the continuation is committed - all in acquisition order, so the
+    /// queue [base, ff...] is appended as one serialized stream. When false (the
+    /// plain/MTP/DFlash paths) the whole run is committed as-is.
+    pub fn gate_commit(
+        &self,
+        seq_ids: &[usize],
+        runs: &[Vec<u32>],
+        ff: bool,
+        seq_infos: &[SpecSeqInfo],
+    ) -> (Vec<Vec<u32>>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>) {
+        let mut reasoning_deltas: Vec<usize> = Vec::with_capacity(runs.len());
+        let mut ff_deltas: Vec<usize> = Vec::with_capacity(runs.len());
+        let mut ff_drafted: Vec<usize> = Vec::with_capacity(runs.len());
+        let mut mask_fail_streaks: Vec<usize> = Vec::with_capacity(runs.len());
+        let gated = runs.iter()
+            .enumerate()
+            .map(|(i, run)| {
+                let sid = seq_ids[i];
+                // Capture the reasoning count before the commit (the delta is the
+                // reasoning tokens committed this step).
+                let count_before = self.guided_decoding.reasoning_token_count(sid);
+                // The generation order: the anchor (the run[0], the model-sampled
+                // token), then the ff literals (the grammar-forced, the no the model),
+                // then the drafts (the run[1..], the model-proposed speculative tokens).
+                // The FSM is advanced in that order (the anchor, the ff, the drafts),
+                // so the committed state matches the generation trajectory (the no the
+                // draft proposed from the pre-ff state, the no the ff appended after the
+                // drafts). The sequence queue is assembled in the same order.
+                //
+                // Step 1: commit the anchor (the run[0]). The anchor is always legal
+                // (the model sampled it from the masked distribution), so the legal
+                // prefix is the anchor itself.
+                let n_anchor = self.guided_decoding.commit_run(sid, &run[..1.min(run.len())]);
+                let mut queue = run[..n_anchor].to_vec();
+                if n_anchor < run.len().min(1) {
+                    self.guided_decoding.resync(sid);
+                }
+                // Step 2: commit the ff literals (the grammar-forced continuation from the
+                // post-anchor state). The ff KV is written by the run_ff_forward (the no
+                // the un-backed commit). On a ff KV failure, the FSM rolls back to the
+                // pre-ff boundary (the no the committed-but-un-backed desync) + the ff is
+                // not queued (the no the sequence entry).
+                if ff {
+                    let pre_ff_boundary = self.guided_decoding.llm_tokens_len(sid);
+                    let ff_run = self.guided_decoding.commit_ff_run(sid);
+                    if !ff_run.is_empty() {
+                        let ff_kv_ok = seq_infos
+                            .get(i)
+                            .map(|info| self.run_ff_forward(info, &ff_run).is_ok())
+                            .unwrap_or(false);
+                        if ff_kv_ok {
+                            queue.extend(ff_run.clone());
+                            spec_stats_update_ff("SpecFF", sid, ff_run.len(), ff_run.len());
+                            ff_deltas.push(ff_run.len());
+                            ff_drafted.push(ff_run.len());
+                            if debug_llg() && self.is_first_rank {
+                                crate::log_info!(
+                                    "[llg] seq {sid}: ff accepted {} token(s) into the sequence {:?}",
+                                    ff_run.len(),
+                                    ff_run
+                                );
+                            }
+                        } else {
+                            self.guided_decoding.resync_to(sid, pre_ff_boundary);
+                            spec_stats_update_ff("SpecFF", sid, ff_run.len(), 0);
+                            ff_deltas.push(0);
+                            ff_drafted.push(ff_run.len());
+                        }
+                    } else {
+                        ff_deltas.push(0);
+                        ff_drafted.push(0);
+                    }
+                } else {
+                    ff_deltas.push(0);
+                    ff_drafted.push(0);
+                }
+                // Step 3: commit the drafts (the run[1..], the model-proposed speculative
+                // tokens) from the ff-advanced state. The legal prefix is the accepted
+                // drafts. The drafts are queued after the ff (the no the generation order).
+                if run.len() > 1 {
+                    let n_drafts = self.guided_decoding.commit_run(sid, &run[1..]);
+                    queue.extend(run[1..][..n_drafts].to_vec());
+                    if n_drafts < run.len() - 1 {
+                        self.guided_decoding.resync(sid);
+                    }
+                }
+                // The reasoning-budget hard stop: when the reasoning budget is exhausted
+                // (the count-based, grammar-free check), force-inject the
+                // terminator run through the gate as one atomic `commit_run`, so
+                // no sampled token lands between its parts. The budget check is
+                // count-based (the `reasoning_token_count`), NOT phase-gated,
+                // so it fires with or without a grammar (the env-var-only case).
+                if self.guided_decoding.reasoning_budget_exhausted(sid) {
+                    let terminator = self.guided_decoding.reasoning_terminator(sid);
+                    if !terminator.is_empty() {
+                        let n_term = self.guided_decoding.commit_run(sid, &terminator);
+                        queue.extend(terminator[..n_term].to_vec());
+                        crate::log_info!(
+                            "[reasoning-bias] seq {sid}: budget exhausted, injected reasoning terminator ({n_term} tokens) through the gate"
+                        );
+                    }
+                }
+                // The reasoning delta for this step (the tokens committed while in the
+                // Reasoning phase). The engine uses this to increment the Sequence's
+                // reasoning_token_count (the always-present owner, the no the optional
+                // GuidanceState).
+                let count_after = self.guided_decoding.reasoning_token_count(sid);
+                reasoning_deltas.push(count_after.saturating_sub(count_before));
+                // The loop-kick at the gate (the no the sample-site kick): when a loop
+                // is confirmed (the kick_store has an active kick for this seq), the
+                // gate rejects the looping tokens (the run's trailing matches the repeating
+                // unit) + forces the break token (the seed). This is the looping
+                // tokens from being added to the sequence, on ALL paths (the MTP, the
+                // DFlash, the plain) — the gate is the single FSM-advance point where
+                // every path converges. The sample-site kick (the apply_loop_kicks, the
+                // -inf logits bias) is the soft steering; this is the hard backstop.
+                if let Some(kick) = self.kick_store.read().get(sid) {
+                    let unit_len = kick.unit.len();
+                    if unit_len > 0 && queue.len() >= unit_len {
+                        // The run's tail matches the repeating unit (the loop is still
+                        // active). Truncate the queue at the loop boundary + force the
+                        // break token (the seed).
+                        let tail = &queue[queue.len() - unit_len..];
+                        if tail == &kick.unit[..] {
+                            let boundary = queue.len() - unit_len;
+                            queue.truncate(boundary);
+                            // The seed token (the seed, the first ~20% of the unit) is
+                            // forced through the gate (the no the loop continuing).
+                            let n_seed = self.guided_decoding.commit_run(sid, &kick.seed);
+                            queue.extend(kick.seed[..n_seed].to_vec());
+                            crate::log_info!(
+                                "[llg] seq {sid}: loop-kick at the gate — truncated {unit_len} looping token(s) + forced the break seed ({n_seed} tokens)"
+                            );
+                        }
+                    }
+                }
+                queue
+            })
+            .collect();
+        // The mask-fail re-decode bound (the no infinite stall on a terminally-stuck
+        // FSM): after this step's commit, the per-seq mask-fail streak reflects whether
+        // the seq made progress (the `commit_run` cleared it) or mask-failed again (the
+        // `mask_fail` bumped it). When the streak hits `MAX_MASK_FAIL_STREAK`, the
+        // The per-seq mask-fail streak (the raw count, the no the bound decision -- the
+        // engine applies the model-dependent bound: 1 for hybrid-mamba (the re-decode
+        // desyncs the in-place mamba state, the no a safe re-decode), 32 for paged-
+        // attention (the KV is idempotent, the re-decode is safe up to the bound).
+        // This rides the `GateCommitResponse` IPC (the no a Thread-only check,
+        // production is all IPC on CUDA).
+        for &sid in seq_ids {
+            mask_fail_streaks.push(self.guided_decoding.mask_fail_streak(sid));
+        }
+        (gated, reasoning_deltas, ff_deltas, ff_drafted, mask_fail_streaks)
+    }
+
+    /// Bridge the anti-loop kick from the engine (the FULL repeating unit +
+    /// the seed + the period). The kick is applied at the next sampling step (the
+    /// LogitsProcessor consults the kick_store). The unit is the whole cycle --
+    /// excluding all P tokens at the trigger position is what breaks the loop (the
+    /// no single-forbid-token whack-a-mole).
+    pub fn set_loop_kick(&self, seq_id: usize, unit: Vec<u32>, seed: Vec<u32>, period: u32) {
+        use crate::utils::loop_detect::LoopSpan;
+        self.kick_store.write().apply(
+            seq_id,
+            &LoopSpan {
+                period,
+                unit,
+                seed,
+            },
+        );
+    }
+
+    /// Clear the anti-loop kick for a sequence (the loop cleared).
+    pub fn clear_loop_kick(&self, seq_id: usize) {
+        self.kick_store.write().remove(seq_id);
+    }
+
+    /// Apply the active anti-loop kicks as a sampling constraint (the per-row
+    /// exclusion of the loop's tokens, before sampling). The FULL
+    /// repeating unit (all P tokens) is set to -inf at the trigger position (the
+    /// no single forbid token -- a period-P loop needs the whole cycle excluded to
+    /// break); the seed tokens (the first ~20%) get an ADDITIONAL penalty scaled by
+    /// the period (the longer the loop, the harder the kick). This is a sampling
+    /// intervention, not a grammar-mask perturbation, so the mask stays a pure
+    /// function of the settled FSM state. No-op when no kick is active for the batch.
+    fn apply_loop_kicks(&self, logits: &Tensor, seq_ids: &[usize]) -> Tensor {
+        // The kick applies REGARDLESS of the full-envelope grammar (the
+        // prior llg_full skip assumed the grammar breaks the loop -- falsified by
+        // the 20261013 log, where a period-24 loop ran 50+ steps under
+        // XINFER_LLG_FULL=1). The repetition defense is orthogonal to the grammar
+        // constraint (the loop tokens are all grammar-legal).
+        let kicks = self.kick_store.read();
+        let any_kick = seq_ids.iter().any(|&sid| kicks.is_active(sid));
+        if !any_kick {
+            return logits.clone();
+        }
+        let (b, v) = logits.dims2().expect("logits is 2-D");
+        let device = logits.device();
+        let mut flat: Vec<f32> = vec![0.0f32; b * v];
+        for (i, &sid) in seq_ids.iter().enumerate() {
+            if let Some(kick) = kicks.get(sid) {
+                // The SOFT unit exclusion (the no hard -inf): a finite penalty that
+                // steers away from the loop but CANNOT empty the grammar's allow-set.
+                // The kick is applied to the logits BEFORE the grammar mask (the VOB /
+                // the where_cond), so a hard -inf here would zero out the forced
+                // singleton at a grammar-forcing position (the mask allows only that
+                // token, the kick -inf'd it -> the empty candidate set -> the Stage B
+                // degenerate guard -> token 0 -> the stuck state). A finite penalty
+                // keeps the forced token sampleable (it's the only candidate, so it
+                // wins regardless of the penalty) while still deprioritizing the loop
+                // at free-choice positions. The penalty scales with the caught period
+                // (the longer the loop, the harder the steer, the no a magic constant).
+                let unit_penalty = -(kick.period as f32) * 2.0;
+                for &unit_tok in &kick.unit {
+                    if (unit_tok as usize) < v {
+                        let cell = &mut flat[i * v + unit_tok as usize];
+                        if *cell > unit_penalty {
+                            *cell = unit_penalty;
+                        }
+                    }
+                }
+                // The seed penalty (the scaling-by-caught-length, the additive
+                // hardening on the unit's trigger tokens).
+                let penalty = -(kick.period as f32) * 4.0;
+                for &seed_tok in &kick.seed {
+                    if (seed_tok as usize) < v {
+                        let cell = &mut flat[i * v + seed_tok as usize];
+                        if *cell > penalty {
+                            *cell = penalty;
+                        }
+                    }
+                }
+            }
+        }
+drop(kicks);
+        let penalty_tensor = Tensor::from_vec(flat, (b, v), device).expect("penalty tensor");
+        logits.add(&penalty_tensor).expect("add penalty to logits")
+    }
+
+    /// The KV-backed ff forward (the batched ff fast-forward): a prefill-style forward
+    /// over the grammar-forced ff span (the `[ff_0..ff_n]`, the positions
+    /// `seq.len()+1 .. seq.len()+1+n_ff`), writing the ff tokens' KV into the cache.
+    /// The ff tokens are deterministic (the grammar forces them, the no sampling) --
+    /// this forward is purely to materialize their KV (the attention over them for
+    /// subsequent positions). The base token's KV is already written by the prior
+    /// decode forward; this covers only the ff span.
+    ///
+    /// The `seq_info` must have its block_table pre-allocated to cover
+    /// `seq_info.len + 1 + ff_tokens.len()` positions (the base + the ff span, the
+    /// `pre_allocate_ff_blocks`), else the `compute_slot_mappings` bails (the missing
+    /// KV block). Returns the ff span's logits (the no the caller samples them -- they
+    /// are the deterministic ff tokens, the forward is for the KV write only).
+    pub fn run_ff_forward(
+        &self,
+        seq_info: &SpecSeqInfo,
+        ff_tokens: &[u32],
+    ) -> Result<Option<Tensor>> {
+        if ff_tokens.is_empty() {
+            return Ok(None); // the no ff span (the no forward, the no KV write)
+        }
+        let block_size = self.block_size();
+        let ff_span_len = ff_tokens.len();
+        // The ff span positions are [seq.len()+1, seq.len()+1+ff_span_len) (the base is
+        // at seq.len(), already written by the prior decode forward). The
+        // `compute_slot_mappings` uses `seq_info.len + i`, so I pass an offset
+        // `SpecSeqInfo` (the len = seq.len()+1) to shift the span to the ff positions.
+        let ff_seq_info = SpecSeqInfo {
+            id: seq_info.id,
+            len: seq_info.len + 1, // the base is at seq.len (the prior decode wrote it)
+            block_table: seq_info.block_table.clone(),
+            k: ff_span_len,
+        };
+        let slot_mappings = self.compute_slot_mappings(&ff_seq_info, ff_span_len, block_size, "ff")?;
+        let input_ids = Tensor::from_vec(
+            ff_tokens.iter().map(|&t| t as i64).collect::<Vec<_>>(),
+            (ff_span_len,),
+            self.device(),
+        )?;
+        let positions = Tensor::from_vec(
+            ((seq_info.len + 1)..(seq_info.len + 1 + ff_span_len)).map(|p| p as i64).collect::<Vec<_>>(),
+            (ff_span_len,),
+            self.device(),
+        )?;
+        let metadata = self.build_ff_metadata(&seq_info, &slot_mappings, ff_span_len)?;
+        // The ff forward is a PREFILL-style forward over the ff span (the `is_prefill`
+        // linear mode, the no the decode mode). The ff tokens are grammar-derived (the
+        // `ff_tokens` from the `GuidanceState`), NOT model-derived -- so the forward is
+        // the SAME for every model (the `model_call!` dispatch, the no a model-specific
+        // ff path). The image param is `None` (the image was consumed in the base
+        // prefill, the ff span is a pure text continuation).
+        let prefill_guard = set_linear_is_prefill(true);
+        let kv_cache = self.get_kv_cache();
+        let kv_pairs = kv_cache.as_pairs();
+        let logits = crate::model_call!(
+            &self.model,
+            forward,
+            (&input_ids, &positions, kv_pairs, &metadata),
+            {
+                Qwen3 => false,
+                Qwen3MoE => false,
+                Qwen3_5 => false,
+                Qwen3_5MoE => false,
+                Qwen4 => false,
+                LLaMa => false,
+                LLaMa4 => None,
+                Phi4 => false,
+                GLM4 => false,
+                GLM4MoE => false,
+                GLM4MoeLite => false,
+                DeepSeek => false,
+                DeepSeekV4 => false,
+                GLM5 => false,
+                Mistral3VL => None,
+                Gemma3 => None,
+                Gemma4 => false,
+                Qwen3VL => None,
+                MiniMax => false,
+            }
+        )?;
+        // The prefill-mode guard must outlive the forward (the `set_linear_is_prefill`
+        // is a thread-local the linear layers read); drop it explicitly after the
+        // forward so the mode resets (the no a dangling guard, the no an unused-var
+        // warning -- the guard is named, not underscored).
+        drop(prefill_guard);
+        drop(kv_cache);
+        Ok(Some(logits))
+    }
+
+    /// The reasoning-budget promotion (the sampling bias, the no the grammar mask).
+    /// For each sequence with a `reasoning_budget` set + a non end token,
+    /// adds a positive logit bias to the end-of-reasoning token that ramps up as
+    /// the reasoning count approaches the budget. This steers the model to
+    /// transition from reasoning to the smoothly (the no the hard grammar
+    /// cutoff). The bias is:
+    /// - `0.0 when `remaining > threshold` (the budget is far, no steering)
+    /// - ramping from 0 to `max_bias` as `remaining` goes from `threshold` to 0
+    ///   (the quadratic ramp, the smooth transition)
+    /// - `max_bias` when `remaining <= 0` (the budget exhausted, force the end token)
+    /// The `threshold` is `budget / 4` (the ramp starts at the last quarter of
+    /// the budget). The `max_bias` is 10.0 (a strong but not infinite push; the
+    /// model can still override with a sufficiently high logit for a non-end token).
+    /// No-op when no sequence has a budget + a reasoning end token.
+    fn apply_reasoning_bias(&self, logits: &Tensor, seqs: &Seqs, seq_ids: &[usize]) -> Tensor {
+        // The per-seq budget (the request's `reasoning_budget`, falling back to the
+        // XINFER_MAX_REASONING_TOKENS env) + the reasoning end token (the
+        // `guidance_reasoning_end_ids`). One control path: the env var sets the
+        // default budget, a per-request value overrides it.
+        //
+        // The hot-path cost is O(batch) (one map over the seqs to gather the
+        // per-seq budget + end token), not O(batch^2) (the prior nested `find`).
+        let env_budget = max_reasoning_tokens();
+        // The per-seq (budget, end_token) gathered in one pass (the O(batch), the no
+        // the prior O(batch^2) nested find). The `None` entry means no bias for that
+        // seq (the no budget or the no end token).
+        let per_seq: Vec<Option<(usize, u32)>> = match seqs {
+            Seqs::SeqRefs(refs) => refs
+                .iter()
+                .map(|s| {
+                    let bp = s.sampling_params.reasoning_budget.or(env_budget);
+                    match (bp, s.sampling_params.guidance_reasoning_end_ids.first().copied()) {
+                        (Some(b), Some(e)) => Some((b, e)),
+                        _ => None,
+                    }
+                })
+                .collect(),
+            Seqs::DecodeVec(v) => v
+                .iter()
+                .map(|s| {
+                    let bp = s.sampling_params.reasoning_budget.or(env_budget);
+                    match (bp, s.sampling_params.guidance_reasoning_end_ids.first().copied()) {
+                        (Some(b), Some(e)) => Some((b, e)),
+                        _ => None,
+                    }
+                })
+                .collect(),
+        };
+        // No seq has a budget + an end token: the no-op fast path (no flat
+        // allocation, no per-seq loop).
+        if per_seq.iter().all(|e| e.is_none()) {
+            return logits.clone();
+        }
+        let (b, v) = logits.dims2().expect("logits is 2-D");
+        let device = logits.device();
+        let mut flat: Vec<f32> = vec![0.0f32; b * v];
+        // Track whether any seq actually gets a non-zero bias. When none do (the
+        // counts are all below the ramp threshold), skip the GPU allocation + the
+        // add entirely (the no-op fast path) — a full [batch, vocab] F32 tensor
+        // every step would waste GPU memory + is what OOMs under memory pressure.
+        let mut any_nonzero = false;
+        for (i, &sid) in seq_ids.iter().enumerate() {
+            let Some(entry) = per_seq.get(i) else { continue };
+            let Some((budget, end_token)) = entry else { continue };
+            let budget = *budget;
+            let end_token = *end_token;
+            if (end_token as usize) >= v {
+                continue; // the end token is out of vocab range (the no-op)
+            }
+            // The reasoning count (runs in both phases; the single-phase full-envelope
+            // counts every generated token, so the bias is live there too).
+            let count = self.guided_decoding.reasoning_token_count(sid);
+            // SOFT RAMP ONLY: steer toward the end token as the budget approaches.
+            // The hard stop (the forced terminator injection) lives in the gate
+            // (the `gate_commit`), not here — keeping the two tiers separate means
+            // the ramp never double-emits the EOR with the gate's injection.
+            let bias = reasoning_bias_value(count, budget);
+            if bias > 0.0 {
+                flat[i * v + end_token as usize] = bias;
+                any_nonzero = true;
+static BIAS_RAMP_LOGGED: OnceLock<Mutex<HashSet<usize>>> =
+    OnceLock::new();
+        let set = BIAS_RAMP_LOGGED.get_or_init(|| Mutex::new(HashSet::new()));
+                if set.lock().unwrap().insert(sid) {
+                    crate::log_info!(
+                        "[reasoning-bias] seq {sid}: ramp active (count={count}, budget={budget}, bias={bias:.2}), steering end-of-reasoning token {end_token}"
+                    );
+                }
+            }
+        }
+        // The no seq has a non-zero bias (the counts are all below the ramp
+        // threshold): return the logits unchanged, no GPU allocation.
+        if !any_nonzero {
+            return logits.clone();
+        }
+        let bias_tensor = Tensor::from_vec(flat, (b, v), device).expect("bias tensor");
+        logits.add(&bias_tensor).expect("add reasoning bias to logits")
+    }
+
+    /// Resolve the per-sequence sampling strategy (the Q / top_p / top_k per
+    /// batch row) for the QoS-gated per-seq sampling.
+    fn resolve_perseq_sampling(
+        seqs: &Seqs,
+        logits: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let b = match seqs {
+            Seqs::SeqRefs(s) => s.len(),
+            Seqs::DecodeVec(v) => v.len(),
+        };
+        let device = logits.device();
+        let mut temps = Vec::with_capacity(b);
+        let mut top_ps = Vec::with_capacity(b);
+        let mut top_ks = Vec::with_capacity(b);
+        match seqs {
+            Seqs::SeqRefs(s) => {
+                for seq in *s {
+                    let sp = &seq.sampling_params;
+                    temps.push(sp.temperature.unwrap_or(0.7));
+                    top_ps.push(sp.top_p.unwrap_or(0.95));
+                    top_ks.push(sp.top_k.unwrap_or(32) as u32);
+                }
+            }
+            Seqs::DecodeVec(v) => {
+                for seq in v.iter() {
+                    let sp = &seq.sampling_params;
+                    temps.push(sp.temperature.unwrap_or(0.7));
+                    top_ps.push(sp.top_p.unwrap_or(0.95));
+                    top_ks.push(sp.top_k.unwrap_or(32) as u32);
+                }
+            }
+        }
+        let temperature_d = Tensor::from_vec(temps, (b,), device)?;
+        let top_p_d = Tensor::from_vec(top_ps, (b,), device)?;
+        let top_k_d = Tensor::from_vec(top_ks, (b,), device)?;
+        Ok((temperature_d, top_p_d, top_k_d))
     }
 
     #[allow(unused)]
@@ -1392,7 +1908,16 @@ match allocator.plan(&device_ids, econfig) {
         } else {
             match &seqs {
                 Seqs::SeqRefs(seqs) => self.prepare_decode(*seqs)?,
-                Seqs::DecodeVec(decode_seqs) => self.prepare_decode(decode_seqs.iter())?,
+                Seqs::DecodeVec(decode_seqs) => {
+                    // The engine-stamped reasoning count (the no the optional
+                    // GuidanceState, which is not populated on the MTP/spec-decode path).
+                    for ds in decode_seqs.iter() {
+                        let eor = ds.sampling_params.guidance_reasoning_end_ids.first().copied().unwrap_or(0);
+                        let newline = ds.sampling_params.guidance_newline_tokens.clone();
+                        self.guided_decoding.set_reasoning_count(ds.id, ds.reasoning_token_count, eor, newline);
+                    }
+                    self.prepare_decode(decode_seqs.iter())?
+                }
             }
         };
 
@@ -1426,7 +1951,7 @@ match allocator.plan(&device_ids, econfig) {
         let mut distinct_tenants: Vec<String> = row_tenants
             .iter()
             .filter_map(|t| t.clone())
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<HashSet<_>>()
             .into_iter()
             .collect();
         for stack in &row_stacks {
@@ -1476,9 +2001,9 @@ match allocator.plan(&device_ids, econfig) {
         // in a TP run — all ranks see the same tenant, so rank-0's log is the
         // representative one).
         if self.is_first_rank {
-            static PROVEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, String)>>> =
-                std::sync::OnceLock::new();
-            let proven = PROVEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static PROVEN: OnceLock<Mutex<HashSet<(usize, String)>>> =
+            OnceLock::new();
+        let proven = PROVEN.get_or_init(|| Mutex::new(HashSet::new()));
             let seq_ids: Vec<usize> = match &seqs {
                 Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
                 Seqs::DecodeVec(seqs) => seqs.iter().map(|s| s.id).collect(),
@@ -1495,7 +2020,7 @@ match allocator.plan(&device_ids, econfig) {
                     let modules = global_adapter_modules(&tenant);
                     let layer_count = modules.iter()
                         .filter_map(|m| m.strip_prefix("layers.").and_then(|rest| rest.split('.').next()))
-                        .collect::<std::collections::HashSet<_>>()
+                        .collect::<HashSet<_>>()
                         .len();
                     crate::log_info!(
                         "[LoRA] seq {seq_id} tenant '{tenant}' active: {count} adapter module(s) across {layer_count} layer(s), delta will be applied"
@@ -1649,7 +2174,7 @@ match allocator.plan(&device_ids, econfig) {
                 if input_metadata.is_mla {
                     if fm.mla_decode_plan_info.is_none() {
                         if let Some(params) = self.flashinfer_kv_params {
-                            fm.mla_decode_plan_info = Some(attention_rs::mla::mla_decode_plan(
+                            fm.mla_decode_plan_info = Some(mla_decode_plan(
                                 &self.device,
                                 params.kv_dtype,
                                 &fm.indptr_host,
@@ -1662,7 +2187,7 @@ match allocator.plan(&device_ids, econfig) {
                     }
                 } else if fm.decode_plan_info.is_none() {
                     if let Some(params) = self.flashinfer_kv_params {
-                        fm.decode_plan_info = Some(attention_rs::flashinfer::decode_plan(
+                        fm.decode_plan_info = Some(decode_plan(
                             &self.device,
                             params.kv_dtype,
                             params.out_dtype,
@@ -2046,7 +2571,7 @@ match allocator.plan(&device_ids, econfig) {
 
             if self.is_mla_model() {
                 if let Some(params) = self.flashinfer_kv_params {
-                    mla_prefill_plan_info = Some(attention_rs::mla::mla_prefill_plan(
+                    mla_prefill_plan_info = Some(mla_prefill_plan(
                         &self.device,
                         &cu_seqlens_q_host_u32,
                         &indptr_host,
@@ -2061,7 +2586,7 @@ match allocator.plan(&device_ids, econfig) {
 
             if !self.is_mla_model() {
                 if let Some(params) = self.flashinfer_kv_params {
-                    prefill_plan_info = Some(attention_rs::flashinfer::prefill_plan(
+                    prefill_plan_info = Some(prefill_plan(
                         &self.device,
                         &cu_seqlens_q_host_u32,
                         &indptr_host,
@@ -2382,12 +2907,12 @@ match allocator.plan(&device_ids, econfig) {
 
                 let sampling = if user_wants_greedy {
                     if self.is_first_rank && seqs[0].num_cached_tokens == 0 {
-                        crate::log_warn!("Using greedy decoding (temperature=0.0)");
+                        crate::log_info!("Using greedy decoding (temperature=0.0)");
                     }
                     Sampling::ArgMax
                 } else if has_user_config {
                     if self.is_first_rank && seqs[0].num_cached_tokens == 0 {
-                        crate::log_warn!(
+                        crate::log_info!(
                             "Using user's sampling params: temp={:?}, top_k={:?}, top_p={:?}, freq_penalty={:?}, pres_penalty={:?}",
                             user_params.temperature,
                             user_params.top_k,
@@ -2404,7 +2929,7 @@ match allocator.plan(&device_ids, econfig) {
                 } else if has_valid_sampling_cfg {
                     let cfg = self.config.generation_cfg.as_ref().unwrap();
                     if self.is_first_rank && seqs[0].num_cached_tokens == 0 {
-                        crate::log_warn!(
+                        crate::log_info!(
                             "Using sampling from generation_config: temp={:?}, top_k={:?}, top_p={:?}, freq_penalty={:?}, pres_penalty={:?}",
                             cfg.temperature,
                             cfg.top_k,
@@ -2485,14 +3010,71 @@ match allocator.plan(&device_ids, econfig) {
             logits.to_owned()
         };
 
-        let guided_requests = guided_decoding_requests(&seqs, &seq_ids);
-        let guided_positions: Vec<usize> = guided_requests
+        // Apply the active anti-loop kicks (the sampling constraint, the per-row
+        // penalty on the logits before sampling). No-op when no kick is active.
+        let logits = self.apply_loop_kicks(&logits, &seq_ids);
+
+        // Apply the reasoning-budget promotion (the sampling bias on the
+        // end-of-reasoning token, not the grammar mask). No-op when no
+        // sequence has a budget + a reasoning end token.
+        let logits = self.apply_reasoning_bias(&logits, &seqs, &seq_ids);
+
+        let all_requests = guided_decoding_requests(&seqs, &seq_ids);
+        let guided_positions: Vec<usize> = all_requests
             .iter()
             .enumerate()
             .filter_map(|(index, request)| request.grammar.is_some().then_some(index))
             .collect();
         let tokens = if guided_positions.is_empty() {
-            self.sample_processed_logits(&logits, &cached_params.sampling)?
+            if qos_enabled() && !is_prefill {
+                // The QoS-gated per-sequence sampling (the §2.4, the additive path): each
+                // sequence samples with its own strategy (the per-batch temperature / top_p /
+                // top_k), instead of the single shared cached_params strategy.
+                let (temperature_d, top_p_d, top_k_d) =
+                    Self::resolve_perseq_sampling(&seqs, &logits)?;
+                self.logit_processor
+                    .sample_with_strategy_perseq(&logits, &temperature_d, &top_p_d, &top_k_d)?
+            } else {
+                self.sample_processed_logits(&logits, &cached_params.sampling)?
+            }
+        } else if vob_sampling() {
+            // The §2.3 VOB-bitset sampling path (the 8× less data than the F32 mask).
+            // The `build_vob_words` computes the per-seq VOB bitset (the compact allowed-token
+            // set), the `sample_with_vob` runs it via the fused bitwise-AND sampler (the no
+            // F32 mask round-trip). The VOB path is selected when the grammar is active (the
+            // `guided_positions` is non-empty) + the `XINFER_VOB_SAMPLING` env is set.
+            let vob_words = self
+                .guided_decoding
+                .build_vob_words(&all_requests, logits.dim(1)?, logits.device())?;
+            // The QoS contract: when QoS is active, each sequence samples with its own
+            // per-request strategy (the temperature / top_p / top_k from the QoS
+            // controller) fused with the VOB grammar mask in one kernel pair (the
+            // `sample_with_vob_perseq`). Without QoS, the shared base strategy is used
+            // (the `sample_with_vob`, the prior behavior). This is what makes the
+            // per-sequence-accurate sampling hold for grammar-constrained (the
+            // agentic tool-calling) requests, not just the unguided ones.
+            let tokens = if qos_enabled() && !is_prefill {
+                let (temperature_d, top_p_d, top_k_d) =
+                    Self::resolve_perseq_sampling(&seqs, &logits)?;
+                self.logit_processor.sample_with_vob_perseq(
+                    &logits,
+                    vob_words.as_ref(),
+                    &temperature_d,
+                    &top_p_d,
+                    &top_k_d,
+                )?
+            } else {
+                self.logit_processor.sample_with_vob(
+                    &logits,
+                    &cached_params.sampling,
+                    vob_words.as_ref(),
+                )?
+            };
+            // The single FSM advance happens in the gate (the `gate_commit`, the
+            // seal). The sample site does NOT commit + does NOT read the ff run
+            // (the `compute_mask` already advanced the parser once to build the
+            // singleton VOB; a second advance here desynced the committed stream).
+            tokens
         } else {
             let guided_indices = Tensor::from_vec(
                 guided_positions.iter().map(|&index| index as u32).collect(),
@@ -2502,23 +3084,92 @@ match allocator.plan(&device_ids, econfig) {
             let original_guided_logits = logits.index_select(&guided_indices, 0)?;
             let guided_requests: Vec<_> = guided_positions
                 .iter()
-                .map(|&index| guided_requests[index])
+                .map(|&index| all_requests[index])
                 .collect();
-            let (guided_logits, guided_step) = self
-                .guided_decoding
-                .apply(&original_guided_logits, &guided_requests)?;
-            let sample_logits = if guided_positions.len() == seq_ids.len() {
-                guided_logits
+            let guided_tokens: Vec<u32> = if spec_mask_offload() {
+                // GPU offload: build mask directly (single compute_mask_or_eos call).
+                // Do NOT call apply() here - it consumes ff_tokens_cache as a side effect,
+                // causing the second compute_mask_or_eos in build_allow_mask to see a
+                // different parser state. The FSM commit for the produced token is done
+                // once, at the terminal ingress (gate_commit), just before the append.
+                if vob_sampling() {
+                    // VOB bitset path: 8x less data than F32 mask.
+                    let vob_words = self
+                        .guided_decoding
+                        .build_vob_words_flat(&all_requests, logits.dim(1)?)
+                        .map(|words| {
+                            // The flat buffer is laid out as [batch, ceil(vocab/32)]
+                            // (build_vob_words_flat allocates the ceil width). The
+                            // reshape must use the SAME ceil width, or a vocab not
+                            // divisible by 32 misaligns every row after the first
+                            // (the kernel reads vob + b*ceil(V/32), the sampler
+                            // validates vw == V.div_ceil(32)).
+                            candle_core::Tensor::from_vec(
+                                words,
+                                (all_requests.len(), logits.dim(1)?.div_ceil(32)),
+                                logits.device(),
+                            )
+                        })
+                        .transpose()?;
+                    let tokens = self.logit_processor.sample_with_vob(
+                        &logits,
+                        &cached_params.sampling,
+                        vob_words.as_ref(),
+                    )?;
+                    // The sample site does NOT read the ff run (the `compute_mask`
+                    // already advanced the parser once; the gate is the single commit).
+                    tokens
+                } else {
+                    let mask = self
+                        .guided_decoding
+                        .build_allow_mask(&all_requests, logits.dim(1)?, logits.device())?;
+                    // A None mask is safe here: build_allow_mask now panics on any
+                    // grammar-active row that FAILS to produce a mask (R5), so a None
+                    // return means either no row has a grammar, or every grammar row
+                    // genuinely allows all tokens (the mask_allows_all, the no gating
+                    // needed). Both are correct to sample unmasked.
+                    let tokens = if qos_enabled() {
+                        // the QoS-gated per-sequence strategy (the additive path): each row
+                        // samples with its own temperature / top_p / top_k.
+                        let (temperature_d, top_p_d, top_k_d) =
+                            Self::resolve_perseq_sampling(&seqs, &logits)?;
+                        match mask.as_ref() {
+                            Some(m) => self.logit_processor.sample_with_strategy_perseq_masked(
+                                &logits, m, &temperature_d, &top_p_d, &top_k_d,
+                            )?,
+                            None => self.logit_processor.sample_with_strategy_perseq(
+                                &logits, &temperature_d, &top_p_d, &top_k_d,
+                            )?,
+                        }
+                    } else {
+                        self.logit_processor.sample_with_strategy_masked(
+                            &logits,
+                            &cached_params.sampling,
+                            mask.as_ref(),
+                        )?
+                    };
+                    // The sample site does NOT read the ff run (the `compute_mask`
+                    // already advanced the parser once; the gate is the single commit).
+                    tokens
+                }
             } else {
-                let guided_delta = (&guided_logits - &original_guided_logits)?;
-                logits.index_add(&guided_indices, &guided_delta, 0)?
+                // Original path: apply() computes masked logits via index_add.
+                let (guided_logits, _guided_step) = self
+                    .guided_decoding
+                    .apply(&original_guided_logits, &guided_requests)?;
+                let sample_logits = if guided_positions.len() == seq_ids.len() {
+                    guided_logits
+                } else {
+                    let guided_delta = (&guided_logits - &original_guided_logits)?;
+                    logits.index_add(&guided_indices, &guided_delta, 0)?
+                };
+                let tokens =
+                    self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
+                // The sample site does NOT read the ff run (the `apply()` ->
+                // `compute_mask` already advanced the parser once; the gate is the single commit).
+                tokens
             };
-            let mut tokens =
-                self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
-            self.guided_decoding
-                .apply_fast_forward(&seq_ids, &mut tokens);
-            self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
-            tokens
+            guided_tokens
         };
 
         // Track tokens for sequences when penalties are enabled
@@ -2557,6 +3208,16 @@ match allocator.plan(&device_ids, econfig) {
             Model::DeepSeekV4(model) => model.clear_seq_state(id),
             _ => {}
         }
+    }
+
+    /// The per-phase token tally (the `[reasoning, text, tool_call]` breakdown) for a seq,
+    /// read from the runner's `GuidedDecoding` (the `GuidanceState.phase_token_counts`).
+    /// The caller (the engine's `notify_runner_finished`) must read this BEFORE
+    /// `finished` (which removes the seq's `GuidanceState`), then stamp it onto the
+    /// sequence's `sched_stats` (the Decoded summary + the /metrics export). The
+    /// `[0; 3]` when the seq had no grammar (the unguided, the no per-phase breakdown).
+    pub fn phase_token_counts(&self, id: usize) -> [usize; 3] {
+        self.guided_decoding.phase_token_counts(id)
     }
 
     pub fn get_model_vocab_size(&self) -> usize {
@@ -2718,10 +3379,10 @@ match allocator.plan(&device_ids, econfig) {
     }
 
     pub fn swap_kvcache(&self, mappings: HashMap<usize, usize>, swap_in: bool) -> Result<bool> {
-        let tq_mode = attention_rs::get_turboquant_mode();
+        let tq_mode = get_turboquant_mode();
         let tq_full = matches!(
             tq_mode,
-            Some(attention_rs::TurboquantMode::Turbo4) | Some(attention_rs::TurboquantMode::Turbo3)
+            Some(TurboquantMode::Turbo4) | Some(TurboquantMode::Turbo3)
         );
 
         if !tq_full {
@@ -2763,7 +3424,7 @@ match allocator.plan(&device_ids, econfig) {
             let num_layers = cpu_tq.len();
             for layer_idx in 0..num_layers {
                 let cpu_layer = &cpu_tq[layer_idx];
-                attention_rs::with_turboquant_layer(layer_idx, |gpu_layer, _| -> Result<()> {
+                with_turboquant_layer(layer_idx, |gpu_layer, _| -> Result<()> {
                     if swap_in {
                         cache::swap_blocks(&cpu_layer.v_absmax, &gpu_layer.v_absmax, &mappings)?;
                         cache::swap_blocks(&cpu_layer.v_quant, &gpu_layer.v_quant, &mappings)?;
@@ -2921,7 +3582,7 @@ match allocator.plan(&device_ids, econfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::{guided_decoding_requests, Seqs};
+    use super::{guided_decoding_requests, reasoning_bias_value, reasoning_budget_exhausted, Seqs};
     use crate::core::sequence::DecodeSequence;
     use crate::utils::config::SamplingParams;
     use llguidance::api::TopLevelGrammar;
@@ -2943,6 +3604,7 @@ mod tests {
             block_tables: vec![0],
             sampling_params,
             spec_k: 0,
+            reasoning_token_count: 0,
         }
     }
 
@@ -2968,5 +3630,47 @@ mod tests {
         assert_eq!(requests[3].seq_id, 13);
         assert!(requests[3].grammar.is_some());
         assert_eq!(requests[3].reasoning_end_ids, &[7, 8]);
+    }
+
+    /// The reasoning-budget promotion ramp (the pure function, the no the runner
+    /// setup). The inclusive: the bias is 0 when the budget is far, ramps up
+    /// quadratically in the last quarter, + is 10.0 when the budget is
+    /// exhausted. The exclusive: a zero budget is always 0 (no steering).
+    #[test]
+    fn reasoning_bias_value_ramp() {
+        // The zero budget: no steering.
+        assert_eq!(reasoning_bias_value(0, 0), 0.0);
+        assert_eq!(reasoning_bias_value(5, 0), 0.0);
+        // The budget far (the count well under the threshold): no steering.
+        // The budget=100, the threshold=25, the count=0 → the remaining=100 > 25 → 0.0.
+        assert_eq!(reasoning_bias_value(0, 100), 0.0);
+        assert_eq!(reasoning_bias_value(50, 100), 0.0); // the remaining=50 > 25
+        // The ramp zone (the count in the last quarter): the quadratic ramp.
+        // The budget=100, the threshold=25. The count=75 → the remaining=25 → threshold → t=0 → 0.0.
+        assert_eq!(reasoning_bias_value(75, 100), 0.0);
+        // The count=87 → the remaining=13, the t=(25-13)/(25-1)=12/24=0.5 → 10*0.25=2.5.
+        assert!((reasoning_bias_value(87, 100) - 2.5).abs() < 1e-5, "the ramp midpoint");
+        // The count=99 → the remaining=1, the t=(25-1)/24=1.0 → 10*1.0=10.0.
+        assert!((reasoning_bias_value(99, 100) - 10.0).abs() < 1e-5, "the ramp top");
+        // The budget exhausted (the count >= the budget): the force (the 10.0).
+        assert_eq!(reasoning_bias_value(100, 100), 10.0);
+        assert_eq!(reasoning_bias_value(150, 100), 10.0);
+    }
+
+    /// The reasoning-budget exhaustion check (the hard-force trigger). The inclusive:
+    /// the count at or above the budget is exhausted (the force fires). The
+    /// exclusive: the count below the budget is not exhausted (the soft ramp),
+    /// + a zero budget is never exhausted (no steering).
+    #[test]
+    fn reasoning_budget_exhausted_triggers_hard_force() {
+        // The inclusive: count >= budget is exhausted.
+        assert!(reasoning_budget_exhausted(32, 32), "count == budget is exhausted");
+        assert!(reasoning_budget_exhausted(50, 32), "count > budget is exhausted");
+        // The exclusive: count < budget is not exhausted.
+        assert!(!reasoning_budget_exhausted(31, 32), "count just under the budget is not exhausted");
+        assert!(!reasoning_budget_exhausted(0, 32), "count 0 is not exhausted");
+        // The zero budget is never exhausted (no steering configured).
+        assert!(!reasoning_budget_exhausted(0, 0), "a zero budget is never exhausted");
+        assert!(!reasoning_budget_exhausted(5, 0), "a zero budget is never exhausted");
     }
 }

@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Mutex;
 use crate::utils::apply_static_rope_scaling;
+use crate::utils::guidance::OutputPhase;
+use crate::utils::guided_decoding::apply_vob_to_logits_row;
 
 pub struct DFlashDrafter {
     pub draft_model: DFlashDraftModel,
@@ -306,6 +308,15 @@ fn forward_collecting_target(
 impl ModelRunner {
     /// One DFlash2 speculative decode step (anchor + draft + verify).
     pub fn run_dflash_decode(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
+        // The engine-stamped reasoning count (the no the optional GuidanceState,
+        // which is not populated on the DFlash path).
+        if let Seqs::DecodeVec(ref decoded) = seqs {
+            for ds in decoded.iter() {
+                let eor = ds.sampling_params.guidance_reasoning_end_ids.first().copied().unwrap_or(0);
+                let newline = ds.sampling_params.guidance_newline_tokens.clone();
+                self.guided_decoding().set_reasoning_count(ds.id, ds.reasoning_token_count, eor, newline);
+            }
+        }
         let batch_size = match seqs {
             Seqs::SeqRefs(ref refs) => refs.len(),
             Seqs::DecodeVec(ref decoded) => decoded.len(),
@@ -318,7 +329,7 @@ impl ModelRunner {
             return Ok(output.into_iter().map(|token| vec![token]).collect());
         };
 
-        let seq_info = match seqs {
+        let mut seq_info = match seqs {
             Seqs::SeqRefs(ref refs) if refs.len() == 1 => SpecSeqInfo {
                 id: refs[0].id,
                 len: refs[0].len(),
@@ -336,6 +347,24 @@ impl ModelRunner {
                 return Ok(output.into_iter().map(|token| vec![token]).collect());
             }
         };
+
+        // The reasoning-budget suppression: when the sequence is still in the
+        // `Reasoning` region + the budget is exhausted (the count >= the
+        // XINFER_MAX_REASONING_TOKENS), suppress the drafts (the k = 0) so the
+        // step produces only the forced anchor (the end-of-reasoning token, the
+        // gate injection). The `phase == Reasoning` guard scopes this to the
+        // reasoning region only — once the EOR is injected the phase moves to
+        // `Text` and drafts resume for the answer region.
+        if seq_info.k > 0
+            && self.guided_decoding().phase(seq_info.id) == OutputPhase::Reasoning
+            && self.guided_decoding().reasoning_budget_exhausted(seq_info.id)
+        {
+            crate::log_info!(
+                "[reasoning-bias] seq {}: budget exhausted, suppressing DFlash drafts (k {} -> 0) to force the end-of-reasoning token",
+                seq_info.id, seq_info.k
+            );
+            seq_info.k = 0;
+        }
 
         let (input_ids, positions, input_metadata) = match seqs {
             Seqs::SeqRefs(ref refs) => self.prepare_decode(refs.iter())?,
@@ -546,7 +575,39 @@ impl ModelRunner {
             )
         };
 
-        let verify_result = verify_draft_greedy(&verify_logits, &draft_tokens)?;
+        // The DFlash drafter proposes from its own logits; the verify step compares the
+        // target's *masked* distribution against the drafts. The `p_target` must be
+        // the grammar-masked distribution (the illegal tokens -inf'd per verify row,
+        // the `project_verify_masks` + the shared `apply_vob_to_logits_row`), not the
+        // raw full-vocab logits -- otherwise the greedy argmax can land on a grammar-
+        // illegal token (the same desync the MTP rejection path had). When the seq is
+        // unguided (the no grammar), the projection is `None` + the raw logits stand.
+        let masked_verify_logits = match self
+            .guided_decoding()
+            .project_verify_masks(seq_info.id, &draft_tokens, verify_len)
+        {
+            Some(Ok(rows)) => {
+                let vocab = verify_logits.dim(1)?;
+                let mut out = verify_logits
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1()?;
+                for (row, mask) in rows.iter().enumerate() {
+                    if row >= verify_len {
+                        break;
+                    }
+                    apply_vob_to_logits_row(&mut out[row * vocab..(row + 1) * vocab], mask);
+                }
+                Tensor::from_vec(out, verify_logits.shape().clone(), verify_logits.device())?
+            }
+            Some(Err(e)) => {
+                // The projection failed (a grammar error mid-verify). Fail closed (the
+                // no silent unmasked fallback, which would admit illegal tokens).
+                return Err(candle_core::Error::wrap(e));
+            }
+            None => verify_logits.clone(), // the unguided seq (the no grammar, the raw logits)
+        };
+        let verify_result = verify_draft_greedy(&masked_verify_logits, &draft_tokens)?;
         let commit_len = 1 + verify_result.num_accepted;
         if verify_result.num_accepted < verify_result.num_proposed
             && !self.rollback_mamba(seq_info.id, commit_len)?
@@ -674,15 +735,32 @@ impl ModelRunner {
             // num_speculative_tokens ceiling). The batch verify below uses the
             // batch-max K (the uniform q_len for the one attention pass), but each
             // seq drafts its own dynamic length (mirroring the MTP batch pattern).
-            // The draft-side grammar mask (the `XINFER_SPEC_DRAFT_MASK` gate): when
-            // on + the seq is guided, draft with the per-slot allow-matrix (the
+// The reasoning-budget suppression (the llg feature): when the sequence is still
+            // in the `Reasoning` region + the budget is exhausted for this seq (the
+            // count >= the XINFER_MAX_REASONING_TOKENS), draft 0 tokens (the anchor
+            // only, the forced end-of-reasoning token). The `phase == Reasoning` guard
+            // scopes this to the reasoning region only.
+            let k = if seq_info.k > 0
+                && self.guided_decoding().phase(seq_info.id) == OutputPhase::Reasoning
+                && self.guided_decoding().reasoning_budget_exhausted(seq_info.id)
+            {
+                crate::log_info!(
+                    "[reasoning-bias] seq {}: budget exhausted, suppressing DFlash drafts (k {} -> 0) to force the end-of-reasoning token",
+                    seq_info.id, seq_info.k
+                );
+                0
+            } else {
+                seq_info.k
+            };
+            // The draft-side grammar mask (the `XINFER_SPEC_DRAFT_MASK` gate): when on
+            // + the seq is guided + k > 0, draft with the per-slot allow-matrix (the
             // MaskStream's greedy pre-walk); else the prior unmasked `draft_tokens`.
-            let allow = if spec_draft_mask() {
+            let allow = if spec_draft_mask() && k > 0 {
                 self.guided_decoding()
                     .mask_stream_for(seq_info.id)
                     .map(|mut stream| {
                         stream.greedy_allow_matrix(
-                            seq_info.k.max(1),
+                            k.max(1),
                             drafter.draft_model.config.vocab_size,
                             &self.device(),
                         )
@@ -698,8 +776,8 @@ impl ModelRunner {
                     &target_hidden,
                     &embed_fn,
                     &lm_head_fn,
-                    anchor_token,
-                    seq_info.k,
+anchor_token,
+                    k,
                     Some(&a),
                 )?,
                 None => drafter.draft_tokens(
@@ -707,7 +785,7 @@ impl ModelRunner {
                     &embed_fn,
                     &lm_head_fn,
                     anchor_token,
-                    seq_info.k,
+                    k,
                 )?,
             };
             draft_tokens.push(drafts);
@@ -796,7 +874,38 @@ impl ModelRunner {
         {
             let offset = index * verify_len;
             let per_seq_logits = verify_logits.narrow(0, offset, verify_len)?;
-            let verify_result = verify_draft_greedy(&per_seq_logits, drafts)?;
+            // The DFlash drafter proposes from its own logits; the verify step compares
+            // the target's *masked* distribution against the drafts. The `p_target`
+            // must be the grammar-masked distribution (the illegal tokens -inf'd per
+            // verify row, the `project_verify_masks` + the shared `apply_vob_to_
+            // logits_row`), not the raw full-vocab logits. When the seq is unguided
+            // (the no grammar), the projection is `None` + the raw logits stand.
+            let masked_per_seq_logits = match self
+                .guided_decoding()
+                .project_verify_masks(seq_info.id, drafts, verify_len)
+            {
+                Some(Ok(rows)) => {
+                    let vocab = per_seq_logits.dim(1)?;
+                    let mut out = per_seq_logits
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1()?;
+                    for (row, mask) in rows.iter().enumerate() {
+                        if row >= verify_len {
+                            break;
+                        }
+                        apply_vob_to_logits_row(&mut out[row * vocab..(row + 1) * vocab], mask);
+                    }
+                    Tensor::from_vec(out, per_seq_logits.shape().clone(), per_seq_logits.device())?
+                }
+                Some(Err(e)) => {
+                    // The projection failed (a grammar error mid-verify). Fail closed
+                    // (the no silent unmasked fallback, which would admit illegal tokens).
+                    return Err(candle_core::Error::wrap(e));
+                }
+                None => per_seq_logits.clone(), // the unguided seq (the no grammar, the raw logits)
+            };
+            let verify_result = verify_draft_greedy(&masked_per_seq_logits, drafts)?;
             let commit_len = 1 + verify_result.num_accepted;
             if verify_result.num_accepted < verify_result.num_proposed
                 && !self.rollback_mamba_at(seq_info.id, commit_len, offset)?

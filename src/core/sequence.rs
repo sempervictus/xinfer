@@ -75,6 +75,13 @@ pub struct Sequence {
     /// 0 = SD not enabled for this seq (the plain decode).
     #[serde(default)]
     pub spec_k: usize,
+    /// The count of reasoning tokens admitted so far (the `Reasoning` phase only).
+    /// Owned by the engine's `Sequence`, stamped onto the `DecodeSequence` clone
+    /// at `prepare_step_view` (the same pattern as `spec_k`). The runner reads
+    /// this (not the optional `GuidanceState`) so the reasoning budget is live
+    /// on every sampling path (the MTP, DFlash, plain).
+    #[serde(default)]
+    pub reasoning_token_count: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -90,6 +97,12 @@ pub struct DecodeSequence {
     /// 0 = SD not enabled (the plain decode).
     #[serde(default)]
     pub spec_k: usize,
+    /// The count of reasoning tokens admitted so far (the `Reasoning` phase only).
+    /// Stamped by the engine at `prepare_step_view` (the same pattern as `spec_k`).
+    /// The runner reads this for the reasoning-budget check (the no the optional
+    /// `GuidanceState`, which is not populated on the MTP/spec-decode path).
+    #[serde(default)]
+    pub reasoning_token_count: usize,
 }
 
 impl DecodeSequence {
@@ -107,6 +120,7 @@ impl DecodeSequence {
             block_tables: sequence.block_table.clone(),
             sampling_params: sequence.sampling_params.clone(),
             spec_k: sequence.spec_k,
+            reasoning_token_count: sequence.reasoning_token_count,
         }
     }
 
@@ -219,6 +233,7 @@ impl Sequence {
             sched_stats: Default::default(),
             active_prefill_chunk: None,
             spec_k: 0,
+            reasoning_token_count: 0,
         }
     }
 

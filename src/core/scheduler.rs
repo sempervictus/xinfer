@@ -9,13 +9,15 @@ qos::{BlockSnapshot, QosController, Regime, ResourceGauges, SamplingOverride, Sc
 use crate::transfer::{PdConfig, PdRole};
 use crate::telemetry::Telemetry;
 use crate::utils::config::{Config, EngineConfig, EosTokenId};
-use crate::utils::env::{qos_enabled, spec_dynamic_k};
+use crate::utils::env::{debug_llg, ff_reserve, qos_enabled, spec_dynamic_k, spec_ff};
+use crate::utils::guidance_grammar::get_lark_from_top_level_grammar;
 use crate::speculative::{uses_builtin_mtp, uses_dflash};
 use crate::core::qos::QosConfig;
 use candle_core::Result;
 use parking_lot::RwLock;
 use regex::Regex;
 use std::collections::{HashMap, VecDeque};
+use std::iter;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
@@ -31,7 +33,12 @@ pub struct Scheduler {
     /// `prepare_step_view` reads it for the per-seq pre-alloc). The no
     /// fixed `num_speculative_tokens` + the no global-EMA (the per-seq isolation: one
     /// sequence's hard region does not shrink another's). Keyed by seq id.
-    last_spec_draft_len: std::collections::HashMap<usize, usize>,
+    last_spec_draft_len: HashMap<usize, usize>,
+    /// The per-seq learned ff (grammar-forced literal) run length, fed back from the
+    /// gate's commit_ff_run (the exact ff run the grammar produced last step). The
+    /// prepare_step_view reads it to pre-allocate exactly the ff span (the no a
+    /// static reserve, the no over- or under-allocation). Keyed by seq id.
+    last_ff_len: HashMap<usize, usize>,
     /// The QoS-computed sampling override (the `AdaptivePlan.sampling`, the
     /// per-class top-k/top-p width). The `schedule()` sets it, the
     /// `prepare_step_view` applies it to the sequences' sampling params (the
@@ -192,6 +199,14 @@ pub fn build_prefix_cache_config(econfig: &EngineConfig) -> PrefixCacheConfig {
 }
 
 impl Scheduler {
+    /// The default ff-span floor (the no the learned length, the first step with no
+    /// history). A realistic tool-call header is ~10-20 forced literals; 16 covers
+    /// the common case without over-reserving. The operator can raise it via the
+    /// XINFER_FF_RESERVE env (the ff_reserve, the no the static cap). The learned
+    /// length (the last_ff_len, the runner feedback) supersedes this floor after the
+    /// first step.
+    const FF_RESERVE_DEFAULT: usize = 16;
+
     pub fn new(runners: Arc<RwLock<RunnerType>>, econfig: &EngineConfig, config: &Config) -> Self {
         let prefix_cache_cfg = build_prefix_cache_config(econfig);
         let mamba_snapshot_default_stride_blocks = econfig
@@ -241,7 +256,8 @@ impl Scheduler {
             physical_pressure: 0.0,
             mmu_idle_vram_bytes: 0,
             mmu_total_vram_bytes: 0,
-            last_spec_draft_len: std::collections::HashMap::new(),
+            last_spec_draft_len: HashMap::new(),
+            last_ff_len: HashMap::new(),
             last_sampling_override: None,
         }
     }
@@ -305,7 +321,7 @@ impl Scheduler {
         self.next_seq_id += 1;
         // Assign the QoS class from the controller's measured output-length estimate
         // (a no-op Throughput default until outputs are observed).
-        seq.qos_class = self.policy.infer_class(&seq);
+seq.qos_class = self.policy.infer_class(&seq);
         // The two-rate sensor (the fast path): the admission records the
         // prefix-hit EMA + the turns counter + the reuse-evidence digest (the
         // NInfer real-demand signal). The `num_cached_tokens` is the prefix hit,
@@ -318,6 +334,15 @@ impl Scheduler {
                 seq.len(),
                 reuse_digest,
             );
+        }
+        if debug_llg() {
+            if let Some(gram) = &seq.sampling_params.grammar {
+                crate::log_info!(
+                    "[llg] Seq {}: TopLevelGrammar:\n{}\n",
+                    seq.id,
+                    get_lark_from_top_level_grammar(gram)
+                );
+            }
         }
         self.waiting.push_back(seq);
         id
@@ -854,6 +879,13 @@ tracing::debug!(
         }
     }
 
+    /// Mutable access to a running sequence by its (the engine-side owner of the
+    /// per-seq counters, e.g. the reasoning_token_count). The `None` when the
+    /// seq is not running (finished, swapped, or unknown).
+    pub fn get_by_id_mut(&mut self, seq_id: usize) -> Option<&mut Sequence> {
+        self.running.iter_mut().find(|s| s.id == seq_id)
+    }
+
     /// The active (running) sequence indices (for the periodic decode throughput log).
     pub fn get_active_indices(&self) -> Vec<usize> {
         (0..self.running.len()).collect()
@@ -1044,23 +1076,57 @@ tracing::debug!(
     /// Called before MTP runs to ensure the verification forward has room
     /// to write KV for speculative positions. The per-seq K: `extra_tokens`
     /// is one entry per `ids` (the seq's own dynamic-K, the no single global K).
-    pub fn pre_allocate_mtp_blocks(&mut self, ids: &[usize], extra_tokens: &[usize]) {
-        for (&idx, &k) in ids.iter().zip(extra_tokens.iter()) {
+    /// The `ff_lens` is the per-seq learned ff (grammar-forced literal) run length
+    /// (the no a static reserve): the MTP model emits the ff literals after the
+    /// verify, so the pre-alloc must cover `seq.len + k + 1 + ff_len` per seq. The
+    /// ff_len is the previous step's actual ff run (the runner feedback, the no a
+    /// guess); a seq with no ff run (the free-text position) has ff_len 0 (the no
+    /// the extra alloc).
+    pub fn pre_allocate_mtp_blocks(&mut self, ids: &[usize], extra_tokens: &[usize], ff_lens: &[usize]) {
+        for ((&idx, &k), &ff_len) in ids.iter().zip(extra_tokens.iter()).zip(ff_lens.iter()) {
             if idx >= self.running.len() {
                 continue;
             }
             let seq = &mut self.running[idx];
-            // The verify writes K+1 positions (the anchor + the K drafts), so the
-            // pre-alloc must cover seq.len() + k + 1 (the no the k-only, which
-            // under-allocates the verify's last position -> the "missing KV block"
-            // crash when the dynamic-K collapses to a small k).
-            let needed_len = seq.len() + k + 1;
+            // The verify writes K+1 positions (the anchor + the K drafts). The ff
+            // span writes ff_len positions past the verify (the grammar-forced
+            // literals, the spec-ff path). The pre-alloc covers both (the no the
+            // ff forward's missing-KV-block bail).
+            let needed_len = seq.len() + k + 1 + ff_len;
             let needed_blocks = needed_len.div_ceil(self.cfg.block_size);
             while seq.block_table.len() < needed_blocks {
                 if let Some(block_id) = self.block_manager.alloc_free_block() {
                     seq.block_table.push(block_id as u32);
                 } else {
                     break;
+                }
+            }
+        }
+    }
+
+    /// The ff-span KV pre-alloc (the batched ff fast-forward, the `run_ff_forward`):
+    /// allocate `ff_len` positions past the base per seq (the base is at `seq.len`,
+    /// the ff span is `[seq.len+1, seq.len+1+ff_len)`). The `ff_lens` is the per-seq
+    /// learned ff run length (the no a static reserve): the previous step's actual ff
+    /// run (the runner feedback). A seq with no ff history gets 0 (the no the ff
+    /// span, the no the extra alloc). The ff forward writes exactly the ff_len
+    /// positions; the unused reserved positions (the ff run shorter than the reserve)
+    /// are freed by the next step's `may_append` reconciliation (the block_table only
+    /// extends as the seq actually grows, not a permanent over-allocation).
+    pub fn pre_allocate_ff_blocks(&mut self, ids: &[usize], ff_lens: &[usize]) {
+        for (&idx, &ff_len) in ids.iter().zip(ff_lens.iter()) {
+            if idx >= self.running.len() {
+                continue;
+            }
+            let seq = &mut self.running[idx];
+            // The ff span covers seq.len() + 1 (the base) + ff_len (the ff span).
+            let needed_len = seq.len() + 1 + ff_len;
+            let needed_blocks = needed_len.div_ceil(self.cfg.block_size);
+            while seq.block_table.len() < needed_blocks {
+                if let Some(block_id) = self.block_manager.alloc_free_block() {
+                    seq.block_table.push(block_id as u32);
+                } else {
+                    break; // the no free blocks (the ff pre-alloc is best-effort, the no a hard fail)
                 }
             }
         }
@@ -1081,6 +1147,20 @@ tracing::debug!(
             // k > 0 guard, which kept the stale K for a plain-decode seq.
             if let Some(seq) = self.running.get(*idx) {
                 self.last_spec_draft_len.insert(seq.id, k);
+            }
+        }
+    }
+
+    /// The ff-length feedback: record the runner-reported per-seq ff run length (the
+    /// exact grammar-forced literal run the gate committed last step) into the per-
+    /// seq ff map, so the NEXT step's `prepare_step_view` pre-allocates exactly that
+    /// many ff blocks (the no a static reserve, the no over- or under-allocation). The
+    /// `ids` + the `ff_lens` are parallel (the per-seq). A ff_len of 0 (the no ff run,
+    /// the free-text position) leaves the seq's ff pre-alloc at 0 (the no the ff span).
+    pub fn record_ff_len_feedback(&mut self, ids: &[usize], ff_lens: &[usize]) {
+        for (idx, &ff_len) in ids.iter().zip(ff_lens.iter()) {
+            if let Some(seq) = self.running.get(*idx) {
+                self.last_ff_len.insert(seq.id, ff_len);
             }
         }
     }
@@ -1132,10 +1212,26 @@ tracing::debug!(
                 // pre-alloc for a k == 0 seq is a harmless no-op (the no the double-alloc,
                 // the pre_allocate_mtp_blocks only extends the block_table if it's short).
                 let batch_max_k = per_seq_k.iter().copied().max().unwrap_or(0);
-                let floored: Vec<usize> = std::iter::repeat(batch_max_k.max(1))
+                let floored: Vec<usize> = iter::repeat(batch_max_k.max(1))
                     .take(ids.len())
                     .collect();
-                self.pre_allocate_mtp_blocks(ids, &floored);
+                // The per-seq learned ff length (the no a static reserve): the previous step's
+                // actual ff run (the runner feedback, the record_ff_len_feedback). A seq
+                // with no ff history (the first step, the no grammar) gets 0 (the no the
+                // ff span). This allocates exactly the ff span needed (the no over- or
+                // under-allocation, the no the static FF_RESERVE guess).
+                let ff_lens: Vec<usize> = ids
+                    .iter()
+                    .map(|idx| {
+                        let seq_id = self
+                            .running
+                            .get(*idx)
+                            .map(|s| s.id)
+                            .unwrap_or(*idx);
+                        self.last_ff_len.get(&seq_id).copied().unwrap_or(ff_reserve().unwrap_or(Self::FF_RESERVE_DEFAULT))
+                    })
+                    .collect();
+                self.pre_allocate_mtp_blocks(ids, &floored, &ff_lens);
                 // The stamp the per-seq K onto the sequences (the travels via the
                 // DecodeSequence.spec_k to the runner, the no fixed ceiling) + onto the
                 // sched_stats (the report carrier, the no the admission-time 0 -- the
@@ -1144,9 +1240,35 @@ tracing::debug!(
                     if let Some(seq) = self.running.get_mut(*idx) {
                         seq.spec_k = k;
                         seq.sched_stats.spec_k = k;
+                        // The reasoning_token_count is already on the seq (the prior
+                        // step's gate_commit incremented it). It stamp here is a
+                        // no-op for the field (it travels via the Sequence clone at
+                        // the freeze below), but it makes the intent explicit: the
+                        // runner reads seq.reasoning_token_count from the clone.
                     }
                 }
             }
+        }
+        // The ff-span KV pre-alloc (the batched ff fast-forward, the plain+ff path):
+        // when the spec-ff gate is on + the seq has a grammar (the no MTP/DFlash, the
+        // plain decode with the ff literals), allocate the ff span so the
+        // `run_ff_forward` (the ff KV write) has room. The ff span is the per-seq
+        // learned ff length (the no a static reserve): the previous step's actual ff
+        // run (the runner feedback, the record_ff_len_feedback). A seq with no ff
+        // history gets 0 (the no the ff span, the no the extra alloc).
+        if !is_prefill && spec_ff() && !(uses_builtin_mtp(&self.cfg) || uses_dflash(&self.cfg)) {
+            let ff_lens: Vec<usize> = ids
+                .iter()
+                .map(|idx| {
+                    let seq_id = self
+                        .running
+                        .get(*idx)
+                        .map(|s| s.id)
+                        .unwrap_or(*idx);
+                    self.last_ff_len.get(&seq_id).copied().unwrap_or(ff_reserve().unwrap_or(Self::FF_RESERVE_DEFAULT))
+                })
+                .collect();
+            self.pre_allocate_ff_blocks(ids, &ff_lens);
         }
         // The freeze (the Sequence snapshot, AFTER the write).
         // The §1 sampling override (the per-class top-k/top-p width): the to
@@ -2239,6 +2361,7 @@ cached_tokens: s.num_cached_tokens,
 mod tests {
     use super::{active_sequence_limit, seed_spec_draft_max};
     use crate::utils::config::{EngineConfig, LoraConfig};
+    use std::collections::HashMap;
 
     #[test]
     fn active_sequence_limit_uses_mamba_capacity_for_hybrid_models() {
@@ -2266,6 +2389,7 @@ mod tests {
     fn make_econfig(num_spec: Option<usize>, spec_draft_max: usize) -> EngineConfig {
         let mut econfig = EngineConfig::new(
             None, // model_id
+            None, // reasoning_grammars
             None, // weight_path
             None, // weight_file
             None, // hf_token
@@ -2356,7 +2480,7 @@ mod tests {
     fn record_spec_k_feedback_updates_map_for_zero_k() {
         // The property: for any k (the no just k > 0), the map entry is updated to k.
         // The k == 0 case (the plain-decode fallback) is the no the stale K.
-        let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut map: HashMap<usize, usize> = HashMap::new();
         // The prior step's K (the stale value, the no the k == 0 feedback should clear).
         map.insert(7, 8);
         // The k == 0 feedback (the seq fell back to plain decode): the map updates to 0.
@@ -2377,7 +2501,7 @@ mod tests {
     fn seed_preserves_non_running_feedback() {
         // The prior feedback (the runner's K for seq 5, which is now swapped-out, the no
         // in the running set).
-        let mut prior_feedback: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut prior_feedback: HashMap<usize, usize> = HashMap::new();
         prior_feedback.insert(5, 2); // The seq 5's K is 2 (the weak drafter, the no the ceiling 8).
         // The running set (the no seq 5 -- it's swapped out).
         let running_ids: Vec<usize> = vec![1, 2, 3];
@@ -2401,7 +2525,7 @@ mod tests {
     // seqs' K entries are removed, the live (running + waiting) seqs' K entries are kept.
     #[test]
     fn clear_finished_retains_only_live_seq_k() {
-        let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut map: HashMap<usize, usize> = HashMap::new();
         map.insert(1, 8); // The live running seq.
         map.insert(2, 4); // The live waiting seq.
         map.insert(3, 6); // The finished seq (the no the map entry should be dropped).
@@ -2422,7 +2546,7 @@ mod tests {
     // seed preservation).
     #[test]
     fn cancel_path_removes_k_entry_swap_out_retains_it() {
-        let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut map: HashMap<usize, usize> = HashMap::new();
         map.insert(1, 8); // The cancelled seq (the no the K entry should be dropped).
         map.insert(2, 4); // The swapped-out seq (the no the K entry should be retained).
         // The cancel path: the last_spec_draft_len.remove(&seq_id) (the no the seq 1).

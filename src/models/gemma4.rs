@@ -1310,7 +1310,7 @@ impl Gemma4ForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        _embeded_inputs: bool,
+        _embedded_inputs: bool,
     ) -> Result<Tensor> {
         self.forward_inner(input_ids, positions, kv_caches, input_metadata, false)
     }
@@ -1321,7 +1321,7 @@ impl Gemma4ForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        _embeded_inputs: bool,
+        _embedded_inputs: bool,
     ) -> Result<Tensor> {
         self.forward_inner(input_ids, positions, kv_caches, input_metadata, true)
     }

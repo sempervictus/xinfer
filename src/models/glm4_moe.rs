@@ -409,7 +409,7 @@ impl GLM4MoEForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
         visual_pos_masks: &Option<Tensor>,
         deepstack_visual_embeds: &Option<Vec<Tensor>>,
         return_hidden: bool,
@@ -424,7 +424,7 @@ impl GLM4MoEForCausalLM {
             self.config.sliding_window,
             input_metadata.is_prefill,
         );
-        let mut xs = if embeded_inputs {
+        let mut xs = if embedded_inputs {
             input_ids.to_owned()
         } else {
             self.embed_forward(input_ids)?
@@ -475,14 +475,14 @@ impl GLM4MoEForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
         self.forward_inner(
             input_ids,
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
             &None,
             &None,
             false,
@@ -495,14 +495,14 @@ impl GLM4MoEForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
         self.forward_inner(
             input_ids,
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
             &None,
             &None,
             true,
@@ -515,7 +515,7 @@ impl GLM4MoEForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
         visual_pos_masks: &Option<Tensor>,
         deepstack_visual_embeds: &Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
@@ -524,7 +524,7 @@ impl GLM4MoEForCausalLM {
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
             visual_pos_masks,
             deepstack_visual_embeds,
             false,

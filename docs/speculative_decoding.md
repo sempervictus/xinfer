@@ -248,10 +248,10 @@ the fast-forward path.
 
 ## 6. The sub-repo dependency revs
 
-The attention-rs / llguidance / toktrie revs are pinned to the set this branch
-builds against. The grammar constraint is enforced by the CPU mask (the VOB / F32
-allow-mask offloaded to the fused sampler) + the verify step; there is no separate
-GPU grammar-state tracker on this branch.
+The attention-rs / llguidance / toktrie revs are pinned to the set this branch builds
+against. The grammar constraint is enforced by the CPU mask (the VOB / F32 allow-mask
+offloaded to the fused sampler) + the verify step; there is no separate GPU grammar-state
+tracker on this branch.
 
 ## 7. The dynamic draft-length lookup + the per-drafter acceptance profile (the §2 session work)
 
@@ -321,10 +321,9 @@ combined K1+K2 verified in a single pass).
   forced run, so the fast-forward is a no-op (the base token only). It is most useful for
   tool-call / structured-output decoding.
 - **Draft validation is CPU-only on this branch.** The `validate_tokens` (the
-  non-mutating legal-prefix count, `guidance.rs`) is present for transient
-  recovery: it reports how many of a draft's leading tokens are grammar-legal
-  without advancing the parser. There is no separate GPU grammar-state tracker on
-  this branch.
+  non-mutating legal-prefix count, `guidance.rs`) is present for transient recovery:
+  it reports how many of a draft's leading tokens are grammar-legal without advancing
+  the parser. There is no separate GPU grammar-state tracker on this branch.
 
 ## Actor integration (the `SchedD` speculative paths)
 

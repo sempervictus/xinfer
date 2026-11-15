@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use crate::core::lora::LoraRegistry;
 use crate::core::qos::{QosClass, QosController, Regime, SeqReport};
 use crate::core::scheduler::Scheduler;
 use crate::utils::config::EngineConfig;
@@ -206,6 +207,18 @@ pub struct Telemetry {
     seq_prompt_time_s: IntGaugeVec,
     seq_decode_time_s: IntGaugeVec,
     seq_cached_tokens: IntGaugeVec,
+    /// The per-seq grammar-forced (ff) token count (the spec-decode section, the
+    /// `SchedSeqStats.ff_continuations`). The number of tokens the grammar forced
+    /// (the no model-sampled) over the sequence's lifetime. 0 when the spec-ff path
+    /// is off. Aged out with the per-seq stats (the 60s TTL).
+    seq_spec_ff_continuations: IntGaugeVec,
+    /// The per-seq per-phase decoded-token counts (the `[reasoning, text, tool_call]`
+    /// breakdown, the `SchedSeqStats` per-phase counts). Surfaced so the operator sees
+    /// how many tokens were decoded in each region (the Decoded summary's per-phase
+    /// breakdown, the no just the total). Aged out with the per-seq stats (the 60s TTL).
+    seq_reasoning_tokens: IntGaugeVec,
+    seq_text_tokens: IntGaugeVec,
+    seq_tool_call_tokens: IntGaugeVec,
 
     // The per-seq spec-decode + reasoning stats (the end-of-seq, the aged).
     // The seq_spec_k is exported on the spec-decode branch (the SchedSeqStats.spec_k
@@ -502,6 +515,32 @@ impl Telemetry {
             &["seq_id"],
         ).expect("metric construction");
 
+        // The per-seq grammar-forced (ff) token count (the spec-decode section, the
+        // SchedSeqStats.ff_continuations). The number of tokens the grammar forced
+        // (the no model-sampled) over the sequence's lifetime. 0 when the spec-ff
+        // path is off. Aged out with the per-seq stats (the 60s TTL).
+        let seq_spec_ff_continuations = IntGaugeVec::new(
+            Opts::new("xinfer_seq_spec_ff_continuations", "The per-seq grammar-forced (ff) token count (the spec-decode section, the end-of-seq, the aged)."),
+            &["seq_id"],
+        ).expect("metric construction");
+
+        // The per-seq per-phase decoded-token counts (the `[reasoning, text, tool_call]`
+        // breakdown, the `SchedSeqStats` per-phase counts). The operator sees how many
+        // tokens were decoded in each region (the no just the total). Aged out with the
+        // per-seq stats (the 60s TTL).
+        let seq_reasoning_tokens = IntGaugeVec::new(
+            Opts::new("xinfer_seq_reasoning_tokens", "The per-seq reasoning-region decoded token count (the end-of-seq, the aged)."),
+            &["seq_id"],
+        ).expect("metric construction");
+        let seq_text_tokens = IntGaugeVec::new(
+            Opts::new("xinfer_seq_text_tokens", "The per-seq text-region decoded token count (the end-of-seq, the aged)."),
+            &["seq_id"],
+        ).expect("metric construction");
+        let seq_tool_call_tokens = IntGaugeVec::new(
+            Opts::new("xinfer_seq_tool_call_tokens", "The per-seq tool-call-region decoded token count (the end-of-seq, the aged)."),
+            &["seq_id"],
+        ).expect("metric construction");
+
         // The per-seq spec-decode + reasoning stats are added on the spec-decode + llg
         // branches (the SchedSeqStats fields exist there); not on the qos branch.
         // The CUDA graph pool usage (the runtime, the current + peak MB).
@@ -594,6 +633,10 @@ impl Telemetry {
         registry.register(Box::new(seq_prompt_time_s.clone())).expect("metric registration");
         registry.register(Box::new(seq_decode_time_s.clone())).expect("metric registration");
         registry.register(Box::new(seq_cached_tokens.clone())).expect("metric registration");
+        registry.register(Box::new(seq_spec_ff_continuations.clone())).expect("metric registration");
+        registry.register(Box::new(seq_reasoning_tokens.clone())).expect("metric registration");
+        registry.register(Box::new(seq_text_tokens.clone())).expect("metric registration");
+        registry.register(Box::new(seq_tool_call_tokens.clone())).expect("metric registration");
         registry.register(Box::new(cuda_graph_pool_current_mb.clone())).expect("metric registration");
         registry.register(Box::new(cuda_graph_pool_peak_mb.clone())).expect("metric registration");
         registry.register(Box::new(sched_budget_tokens.clone())).expect("metric registration");
@@ -670,6 +713,10 @@ impl Telemetry {
             seq_prompt_time_s,
             seq_decode_time_s,
             seq_cached_tokens,
+            seq_spec_ff_continuations,
+            seq_reasoning_tokens,
+            seq_text_tokens,
+            seq_tool_call_tokens,
             cuda_graph_pool_current_mb,
             cuda_graph_pool_peak_mb,
             sched_budget_tokens,
@@ -746,6 +793,23 @@ impl Telemetry {
         self.seq_cached_tokens
             .with_label_values(&[&seq_id.to_string()])
             .set(report.cached_tokens as i64);
+        // The per-seq grammar-forced (ff) token count (the spec-decode section, the
+        // SchedSeqStats.ff_continuations). 0 when the spec-ff path is off.
+        self.seq_spec_ff_continuations
+            .with_label_values(&[&seq_id.to_string()])
+            .set(stats.ff_continuations as i64);
+        // The per-seq per-phase decoded-token counts (the `[reasoning, text, tool_call]`
+        // breakdown, the `SchedSeqStats` per-phase counts). 0 when the seq had no
+        // grammar (the unguided, the no per-phase breakdown).
+        self.seq_reasoning_tokens
+            .with_label_values(&[&seq_id.to_string()])
+            .set(stats.reasoning_tokens as i64);
+        self.seq_text_tokens
+            .with_label_values(&[&seq_id.to_string()])
+            .set(stats.text_tokens as i64);
+        self.seq_tool_call_tokens
+            .with_label_values(&[&seq_id.to_string()])
+            .set(stats.tool_call_tokens as i64);
     }
 
     /// Record the per-seq prompt/decode wall time (the server-measured, the
@@ -831,13 +895,15 @@ impl Telemetry {
     }
 
     /// Publish the scheduler resource gauges (the sync, called from the
-    /// /metrics handler). The KV usage, the CPU swap, the mamba slots.
+    /// /metrics handler). The KV block occupancy, the mamba/GDN slot occupancy,
+    /// the CPU swap. A single `resource_gauges()` snapshot keeps the gauges
+    /// consistent (the no multiple round-trips straddling a state change).
     pub fn publish_scheduler_gauges(
         &self,
         scheduler: &Scheduler,
     ) {
-        // The single source (the resource_gauges, the DRY: the console
-        // print_free_blocks + the /metrics both both read this).
+// The single source (the resource_gauges, the DRY: the console
+        // print_free_blocks + the /metrics both read this).
         let g = scheduler.resource_gauges();
         // The existing ratio gauges (the permille, the prior behavior).
         self.kv_cache_usage_ratio.set((g.kv_used_percent * 10.0) as i64);
@@ -875,7 +941,7 @@ impl Telemetry {
     /// is only set when the registry is non-empty at runner-init, and is empty in
     /// the server process when the runner is a separate process). The `None`
     /// registry (no LoRA configured) leaves the gauges at 0 (the prior behavior).
-    pub fn publish_lora_gauges(&self, registry: Option<std::sync::Arc<std::sync::Mutex<crate::core::lora::LoraRegistry>>>) {
+    pub fn publish_lora_gauges(&self, registry: Option<std::sync::Arc<std::sync::Mutex<LoraRegistry>>>) {
         let Some(reg) = registry else {
             return; // the no LoRA registry (the no adapters configured)
         };

@@ -1,7 +1,7 @@
 use crate::core::sequence::{DecodeSequence, Sequence};
 use crate::models::layers::distributed::Id;
 use crate::server::EmbeddingStrategy;
-use crate::speculative::spec_stats::spec_seq_report;
+use crate::speculative::spec_stats::{spec_seq_report, spec_seq_stats_data};
 use crate::utils::config::{Config, EngineConfig, ModelType};
 use crate::utils::downloader::ModelPaths;
 #[cfg(feature = "nccl")]
@@ -186,6 +186,11 @@ pub struct SpecSeqStatsData {
     pub grammar_bound: usize,
     pub target_bound: usize,
     pub ff_continuations: usize,
+    /// The total ff tokens the grammar DRAFTED (forced) across steps, before the
+    /// KV-back check. `ff_continuations` is the ACCEPTED subset (the ff runs that
+    /// survived the KV-back gate + were committed). The drafted-vs-accepted split is
+    /// the FF analog of the spec `proposed`/`accepted`.
+    pub ff_drafted: usize,
     /// The per-position acceptance vector (the K-th position's acceptance count).
     pub accepted_per_pos: Vec<usize>,
     /// The rolling draft-acceptance rate (the `accepted / proposed`).
@@ -328,6 +333,37 @@ pub enum MessageType {
     GetSpecSeqStats(usize),
     /// Response to GetSpecSeqStats.
     SpecSeqStatsResponse(usize, SpecSeqStatsData),
+
+    // The anti-loop kick bridge (the llg sprint): the engine's loop detector bridges
+    // the kick to the runner's sampler (the full repeating UNIT + the seed
+    // + the period -- the no single forbid token, the whole cycle must be excluded).
+    SetLoopKick((usize, Vec<u32>, Vec<u32>, u32)),
+    ClearLoopKick(usize),
+    /// The single matcher-gated ingress (the llg sprint): commit each produced run to
+    /// the grammar FSM + return only the FSM-passing prefix. The `ff` flag selects the
+    /// spec-FF ordered-queue writer. The `seq_infos` carries the per-seq KV metadata
+    /// (the `len` + the `block_table`) so the gate can run the KV-backed ff forward
+    /// (the `run_ff_forward`) before committing the ff run.
+    GateCommit((Vec<usize>, Vec<Vec<u32>>, bool, Vec<crate::speculative::metadata::SpecSeqInfo>)),
+    /// Response to GateCommit (the FSM-passing prefix per run + the per-seq
+    /// reasoning deltas + the per-seq ff-token deltas + the per-seq ff-drafted
+    /// length + the per-seq mask-fail-bound flag + the per-seq spec stats + the
+    /// per-seq phase counts, the engine's reasoning_token_count + the
+    /// sched_stats.ff_continuations increment + the graceful termination on a
+    /// stuck grammar + the end-of-seq spec/phase report). The ff-drafted length
+    /// (the no the ff-accepted) feeds the scheduler's dynamic ff pre-alloc (the
+    /// next step reserves the actual ff span, the no a static reserve). The spec
+    /// stats + phase counts ride this per-step message (the no a separate finish-
+    /// time `GetSpecSeqStats` socket pull, which desynced the finish path).
+    GateCommitResponse(
+        Vec<Vec<u32>>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<SpecSeqStatsData>,
+        Vec<[usize; 3]>,
+    ),
 }
 
 //inter-node communication
@@ -1039,11 +1075,45 @@ Ok(MessageType::RunDecodeSpecFF(sequences)) => {
 Ok(MessageType::ClearBlocks(block_ids)) => {
                 let ret = runner.clear_blocks(block_ids);
                 if ret.is_err() {
-                    crate::log_error!("ClearBlocks failed: {:?}", ret);
+crate::log_error!("ClearBlocks failed: {:?}", ret);
                 }
                 send_local(
                     &mut vec![stream.try_clone()?],
                     &MessageType::ClearBlocksResponse(ret.is_ok()),
+                    false,
+                )?;
+            }
+            Ok(MessageType::GetSpecSeqStats(id)) => {
+                let data = spec_seq_stats_data(id);
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::SpecSeqStatsResponse(id, data),
+                    false,
+                )?;
+            }
+            // The anti-loop kick bridge (the llg): the engine's loop detector
+            // bridges the kick to the runner's sampler. Fire-and-forget (the no
+            // response; the receive_local above already acked the read).
+            Ok(MessageType::SetLoopKick((seq_id, unit, seed, period))) => {
+                runner.set_loop_kick(seq_id, unit.clone(), seed.clone(), period);
+            }
+            Ok(MessageType::ClearLoopKick(seq_id)) => {
+                runner.clear_loop_kick(seq_id);
+            }
+            // The single matcher-gated ingress (the llg seal): commit each produced
+// run to the FSM + keep only the FSM-passing prefix, just before the
+            // sequence append. The `ff` selects the spec-FF ordered-queue writer.
+            Ok(MessageType::GateCommit((seq_ids, runs, ff, seq_infos))) => {
+                let (gated, reasoning_deltas, ff_deltas, ff_drafted, mask_fail_streaks) = runner.gate_commit(&seq_ids, &runs, ff, &seq_infos);
+                // The per-seq spec stats + phase counts ride this per-step response (the
+                // no a separate finish-time `GetSpecSeqStats` socket pull, which desynced
+                // the finish path). The master caches them in-process each step; at
+                // finish it reads its own cache (the author's master-side-stats pattern).
+                let spec_stats: Vec<SpecSeqStatsData> = seq_ids.iter().map(|&sid| spec_seq_stats_data(sid)).collect();
+                let phase_counts: Vec<[usize; 3]> = seq_ids.iter().map(|&sid| runner.phase_token_counts(sid)).collect();
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::GateCommitResponse(gated, reasoning_deltas, ff_deltas, ff_drafted, mask_fail_streaks, spec_stats, phase_counts),
                     false,
                 )?;
             }

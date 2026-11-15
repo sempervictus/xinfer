@@ -2097,13 +2097,13 @@ impl DeepSeekV4ForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
         // The V4 kernels accept many query rows, but the compressor and indexer
         // keep one recurrent state machine. Dispatch one request at a time and
         // park that state by sequence id: the scheduler gets a batched API
         // without ever mixing two histories in the same recurrent state.
-        let xs = if embeded_inputs {
+        let xs = if embedded_inputs {
             input_ids.to_owned()
         } else {
             self.embed_forward(input_ids)?
@@ -2175,7 +2175,7 @@ impl DeepSeekV4ForCausalLM {
             request_lens.iter().zip(request_ids.iter()).enumerate()
         {
             let input_slice = xs.narrow(0, offset, seq_len)?.contiguous()?;
-            let token_id_slice = if !embeded_inputs {
+            let token_id_slice = if !embedded_inputs {
                 Some(input_ids.narrow(0, offset, seq_len)?.contiguous()?)
             } else {
                 None
@@ -2303,14 +2303,14 @@ impl DeepSeekV4ForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
         self.forward(
             input_ids,
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
         )
     }
 
@@ -2320,7 +2320,7 @@ impl DeepSeekV4ForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
         _visual_pos_masks: &Option<Tensor>,
         _deepstack_visual_embeds: &Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
@@ -2329,7 +2329,7 @@ impl DeepSeekV4ForCausalLM {
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
         )
     }
 

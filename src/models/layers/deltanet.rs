@@ -1005,10 +1005,12 @@ impl GatedDeltaNet {
         let scale = 1.0f64 / (head_k_dim as f64).sqrt();
         let d_conv = key_dim * 2 + value_dim;
         let (conv_mtp_state, recurrent_mtp_state) = if config.mtp_enabled {
-            // Must cover packed batch verify: batch_size * (num_speculative + 1).
-            // Default 16 matches historical single-seq verify_len<=16; runner sets
-            // mtp_max_verify_tokens from max_num_parallel_reqs before model build.
-            let max_verify_tokens = config.mtp_max_verify_tokens.max(16);
+            // Must cover the packed batch verify: the MTP dispatch cap (the
+            // mtp_batch_cap, the placeholder max_num_parallel_reqs the buffer is
+            // sized to) × (num_speculative + 1). The cap is enforced at the
+            // dispatch gate (domain/sched.rs use_mtp), so the batch can never
+            // exceed this buffer. No single-seq floor: the cap is the bound.
+            let max_verify_tokens = config.mtp_max_verify_tokens.max(1);
             (
                 Some(Tensor::zeros(
                     (max_verify_tokens, d_conv, conv_kernel_size - 1),

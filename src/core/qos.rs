@@ -1592,6 +1592,22 @@ pub struct SchedSeqStats {
     /// adaptive-K visibility, the no invisible per-step output).
     #[serde(default)]
     pub spec_k: usize,
+    /// The cumulative grammar-forced (ff) tokens auto-generated for this sequence
+    /// (the spec-ff continuation, the `spec_stats_update_ff` count). Surfaced in the
+    /// per-sequence report + the /metrics export so the operator sees how many tokens
+    /// the grammar forced (the no model-sampled). 0 when the spec-ff path is off.
+    #[serde(default)]
+    pub ff_continuations: usize,
+    /// The per-phase decoded-token counts (the `[reasoning, text, tool_call]` tally, the
+    /// `GuidanceState.phase_token_counts`). Surfaced in the Decoded summary + the /metrics
+    /// export so the operator sees how many tokens were decoded in each region. The `[0; 3]`
+    /// when the seq had no grammar (the unguided, the no per-phase breakdown).
+    #[serde(default)]
+    pub reasoning_tokens: usize,
+    #[serde(default)]
+    pub text_tokens: usize,
+    #[serde(default)]
+    pub tool_call_tokens: usize,
 }
 
 impl SchedSeqStats {
@@ -1602,7 +1618,7 @@ pub fn report(&self) -> Option<String> {
         // enabled (the spec_k > 0) — so the operator sees the K the controller
         // chose even with QoS off (the static spec_draft_max path). The no
         // silent omission of the spec stat.
-        if !self.qos_active && self.spec_k == 0 {
+        if !self.qos_active && self.spec_k == 0 && self.ff_continuations == 0 {
             return None;
         }
         // The conditional fields: spec_k is shown only when spec-decode is active
@@ -1629,6 +1645,9 @@ pub fn report(&self) -> Option<String> {
         ];
         if self.spec_k > 0 {
             parts.push(format!(" spec_k={}", self.spec_k));
+        }
+        if self.ff_continuations > 0 {
+            parts.push(format!(" ff_tokens={}", self.ff_continuations));
         }
         if self.model_label != "base" && !self.model_label.is_empty() {
             parts.push(format!(" model={}", self.model_label));

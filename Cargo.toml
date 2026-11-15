@@ -22,6 +22,7 @@ itertools = "0.13.0"
 akin = "0.4.0"
 indicatif = "0.17.11"
 serde_json = "1.0.108"
+serde_yaml = "0.9"
 llguidance = { version = "1.7", default-features = false, features = ["lark", "referencing", "jsonschema_validation"] }
 toktrie_hf_tokenizers = "1.7"
 toktrie = "1.4"
@@ -92,6 +93,12 @@ flashinfer = ["attention-rs/flashinfer"]
 metal = ["candle-core/metal", "candle-nn/metal", "attention-rs/metal", "attention-rs/metal-flash", "dep:metal"]
 python = ["pyo3"]
 nvtx = ["dep:nvtx"]
+# The fused GPU speculative-decode rejection sampler (the attention-rs
+# reject::fused_reject kernel, the Leviathan lossless verify in one launch).
+# Requires the attention-rs rev carrying the reject module (96e7678). Off by
+# default so the default build uses the CPU rejection oracle; enable with
+# --features spec-reject-gpu to use the GPU kernel.
+spec-reject-gpu = ["cuda"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"] }

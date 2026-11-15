@@ -11,6 +11,7 @@ use super::{
     ChatChoice, ChatChoiceChunk, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatMessage, ChatResponseMessage, CompletionTokensDetails, Delta,
     EmbeddingData, EmbeddingOutput, EmbeddingUsage, ErrorMsg, PromptTokensDetails, ServerData,
+    StructuredOutputs,
     Usage, UsageQuery, UsageResponse,
 };
 use crate::core::engine::{LLMEngine, StreamItem};
@@ -23,7 +24,7 @@ use crate::tools::helpers::{
 };
 use crate::tools::{ToolChoice, ToolChoiceMode};
 use crate::utils::config::{ReasoningEffort, SamplingParams};
-use crate::utils::env::stream_reservoir;
+use crate::utils::env::{llg_full_enabled, stream_reservoir};
 use crate::utils::guidance_grammar::{
     build_grammar_from_request, request_has_structured_constraint, request_has_tool_grammar,
     GrammarRequestDispatcher,
@@ -495,6 +496,10 @@ pub async fn chat_completion(
         params.thinking = Some(effort.is_enabled());
         params.reasoning_effort = Some(effort);
     }
+    // The reasoning token budget (the `thinking_budget` alias). When set, the
+    // runner applies a sampling bias to the end-of-reasoning token that ramps
+    // up as the reasoning count approaches the budget (the smooth transition).
+    params.reasoning_budget = request.reasoning_budget;
     let (
         img_cfg,
         model_type,
@@ -520,6 +525,7 @@ pub async fn chat_completion(
 
     let grammar = if request_has_structured_constraint(&request)
         || request_has_tool_grammar(&request, engine_config.enable_tool_grammar)
+        || llg_full_enabled()
     {
         let enforce_parser = engine_config.enforce_parser.clone();
         let tool_parser_name = if let Some(ref enforced) = enforce_parser {
@@ -632,13 +638,17 @@ pub async fn chat_completion(
         .as_millis() as u64;
 
     // Set grammar from unified generation.
-    // When a grammar is active, pass reasoning end token IDs so that
-    // GuidanceState defers grammar constraints until reasoning ends.
+    // When a grammar is active, pass the marker token-id sets so that
+    // GuidanceState can drive the `OutputPhase` machine (the reasoning +
+    // tool-call region tracking) + defer grammar constraints until reasoning
+    // ends (the two-phase mode).
     if let Some(g) = grammar {
         params.grammar = Some(g);
-        if !guidance_tokens.reasoning_end_ids.is_empty() {
-            params.guidance_reasoning_end_ids = guidance_tokens.reasoning_end_ids.clone();
-        }
+        params.guidance_reasoning_end_ids = guidance_tokens.reasoning_end_ids.clone();
+        params.guidance_reasoning_start_ids = guidance_tokens.reasoning_start_ids.clone();
+        params.guidance_tool_call_start_ids = guidance_tokens.tool_call_start_ids.clone();
+        params.guidance_tool_call_end_ids = guidance_tokens.tool_call_end_ids.clone();
+        params.guidance_newline_tokens = guidance_tokens.newline_tokens.clone();
     }
 
     if use_stream {
@@ -838,7 +848,7 @@ if disconnected {
                                     }
                                     if tool_parser.contains_tool_markup(&text) {
                                         suppressed_tool_markup.push_str(&text);
-                                        crate::log_warn!(
+                                        crate::log_info!(
                                             "[Seq {}] Suppressing {} tool-markup chars pending final tool parsing",
                                             current_seq_id,
                                             text.len()
@@ -931,7 +941,7 @@ current_seq_id
                                     }
                                     if tool_parser.contains_tool_markup(&text) {
                                         suppressed_tool_markup.push_str(&text);
-                                        crate::log_warn!(
+                                        crate::log_info!(
                                             "[Seq {}] Suppressing {} buffered tool-markup chars pending final tool parsing",
                                             current_seq_id,
                                             text.len()
@@ -1050,7 +1060,7 @@ l.log_stream_token(&token);
                                         if !buffer.is_empty() {
                                             if tool_parser.contains_tool_markup(&buffer) {
                                                 suppressed_tool_markup.push_str(&buffer);
-                                                crate::log_warn!(
+                                                crate::log_info!(
                                                     "[Seq {}] Suppressing {} buffered tool-markup chars at stream end",
                                                     current_seq_id,
                                                     buffer.len()
@@ -1129,7 +1139,7 @@ l.log_stream_token(&token);
                             } else if !pending_tool_calls.is_empty()
                                 && !suppressed_tool_markup.is_empty()
                             {
-                                crate::log_warn!(
+crate::log_info!(
                                     "[Seq {}] Dropping {} suppressed tool-markup chars because tool calls were recovered",
                                     current_seq_id,
                                     suppressed_tool_markup.len()
@@ -1324,7 +1334,7 @@ l.log_stream_token(&token);
                             decode_time_taken as f64,
                         );
 
-                        crate::log_warn!("--- Performance Metrics ---");
+                        crate::log_info!("--- Performance Metrics ---");
                         if prompt_time_taken > 0.0 {
                             let cached = engine_clone
                                 .read()
@@ -1363,13 +1373,35 @@ l.log_stream_token(&token);
                                 cached
                             );
                         }
-                        crate::log_info!(
-                            "[Seq {}] Decoded: {} tokens in {:.2}s ({:.2} t/s)",
-                            current_seq_id,
-                            total_decoded_tokens,
-                            decode_time_taken,
-total_decoded_tokens as f32 / decode_time_taken.max(0.001)
-                         );
+// The per-phase decoded-token breakdown (the reasoning / text / tool-call regions,
+                          // the `SchedSeqStats` per-phase counts stamped by the engine at seq
+                          // finish). Folded into the `Decoded:` line (the no a separate
+                          // `Phases:` line, the no a bolt-on to the QoS `Scheduling:` line) --
+                          // these ARE decoded-token stats. Shown in parens only when a
+                          // grammar was active (the unguided seq has all-zero counts).
+                          let phase_breakdown = {
+                              let e = engine_clone.read();
+                              e.get_seq_report(current_seq_id)
+                                  .map(|r| (r.sched.reasoning_tokens, r.sched.text_tokens, r.sched.tool_call_tokens))
+                                  .filter(|(r, t, tc)| r + t + tc > 0)
+                          };
+                          match phase_breakdown {
+                              Some((r, t, tc)) => crate::log_info!(
+                                  "[Seq {}] Decoded: {} tokens in {:.2}s ({:.2} t/s) [reasoning={} text={} tool_call={}]",
+                                  current_seq_id,
+                                  total_decoded_tokens,
+                                  decode_time_taken,
+                                  total_decoded_tokens as f32 / decode_time_taken.max(0.001),
+                                  r, t, tc
+                              ),
+                              None => crate::log_info!(
+                                  "[Seq {}] Decoded: {} tokens in {:.2}s ({:.2} t/s)",
+                                  current_seq_id,
+                                  total_decoded_tokens,
+                                  decode_time_taken,
+                                  total_decoded_tokens as f32 / decode_time_taken.max(0.001)
+                              ),
+                          }
 
 // Per-sequence QoS scheduling report: shows the controller's
                         // learning trajectory (gain start->end, measured ITL vs SLO)
@@ -1404,32 +1436,69 @@ total_decoded_tokens as f32 / decode_time_taken.max(0.001)
                         if let Some(spec) = engine_clone.read().get_seq_spec_stats(current_seq_id) {
                             if !spec.mechanism.is_empty() {
                                 let label = format!("{} Speculation", spec.mechanism);
-                                let rate = if spec.proposed > 0 {
-                                    spec.accepted as f64 / spec.proposed as f64 * 100.0
-                                } else {
-                                    0.0
-                                };
-                                let avg = if spec.steps > 0 {
-                                    (spec.accepted + 2 * spec.steps) as f64 / spec.steps as f64
-                                } else {
-                                    1.0
-                                };
-                                crate::log_info!(
-                                    "[Seq {}] {}: steps={} proposed={} accepted={} rate={:.1}% avg_tok/step={:.2} | bound(tgt/grm): {}/{}",
-                                    current_seq_id,
-                                    label,
-                                    spec.steps,
-                                    spec.proposed,
-                                    spec.accepted,
-                                    rate,
-                                    avg,
-                                    spec.target_bound,
-                                    spec.grammar_bound
-                                );
+let rate = if spec.proposed > 0 {
+                                     spec.accepted as f64 / spec.proposed as f64 * 100.0
+                                 } else {
+                                     0.0
+                                 };
+                                 let avg = if spec.steps > 0 {
+                                     (spec.accepted + 2 * spec.steps) as f64 / spec.steps as f64
+                                 } else {
+                                     1.0
+                                 };
+                                 // The FF drafted-vs-accepted split (the FF analog of the spec
+                                 // `proposed`/`accepted`): the cumulative counts + the per-step
+                                 // averages (the ff runs happen on a subset of steps, the avg is
+                                 // over all steps, consistent with `avg_tok/step`).
+                                 let ff_rate = if spec.ff_drafted > 0 {
+                                     spec.ff_continuations as f64 / spec.ff_drafted as f64 * 100.0
+                                 } else {
+                                     0.0
+                                 };
+                                 let ff_avg_drafted = if spec.steps > 0 {
+                                     spec.ff_drafted as f64 / spec.steps as f64
+                                 } else {
+                                     0.0
+                                 };
+                                 let ff_avg_accepted = if spec.steps > 0 {
+                                     spec.ff_continuations as f64 / spec.steps as f64
+                                 } else {
+                                     0.0
+                                 };
+                                 crate::log_info!(
+                                     "[Seq {}] {}: steps={} proposed={} accepted={} rate={:.1}% avg_tok/step={:.2} | bound(tgt/grm): {}/{} | ff(draft/accept)={}/{} ff_rate={:.1}% ff_avg(draft/accept)={:.2}/{:.2}",
+                                     current_seq_id,
+                                     label,
+                                     spec.steps,
+                                     spec.proposed,
+                                     spec.accepted,
+                                     rate,
+                                     avg,
+                                     spec.target_bound,
+                                     spec.grammar_bound,
+                                     spec.ff_drafted,
+                                     spec.ff_continuations,
+                                     ff_rate,
+                                     ff_avg_drafted,
+                                     ff_avg_accepted
+                                 );
                             }
                         }
 
-                        break;
+// Loop-defense report: shown only when a guard fired (the no
+                          // noise for clean sequences). The [llg] prefix + the warn level
+                          // make it visible to the admins (the no grammar-digging).
+                          if let Some(loop_stats) = engine_clone.read().get_seq_loop_stats(current_seq_id) {
+                              if loop_stats.guards > 0 {
+                                  crate::log_warn!(
+                                      "[llg] [Seq {}] {}",
+                                      current_seq_id,
+                                      loop_stats.report()
+                                  );
+                              }
+                          }
+
+                         break;
                     }
                     StreamItem::Error(e) => {
                         crate::log_error!("[Seq {}] Stream error: {}", current_seq_id, e);
@@ -1661,7 +1730,7 @@ total_decoded_tokens as f32 / decode_time_taken.max(0.001)
             });
         }
 
-        crate::log_warn!("--- Performance Metrics ---");
+        crate::log_info!("--- Performance Metrics ---");
         crate::log_info!(
             "[{} requests] ⏱️ Prompt tokens: {} in {:.2}s ({:.2} t/s)",
             choices.len(),
@@ -2082,6 +2151,32 @@ mod tests {
         deltas
     }
 
+    // The /v1/grammar grammar_type -> StructuredOutputs mapping (the pure function,
+    // the end-to-end mapping test without a live model).
+    #[test]
+    fn grammar_type_maps_to_structured_outputs() {
+        // json_schema -> the json field (the parsed schema).
+        let so = map_grammar_type_to_structured_outputs("json_schema", "{\"a\":1}");
+        assert!(so.json.is_some(), "json_schema maps to the json field");
+        assert!(so.regex.is_none() && so.choice.is_none() && so.grammar.is_none());
+
+        // regex -> the regex field (the raw pattern).
+        let so = map_grammar_type_to_structured_outputs("regex", "^[a-z]+$");
+        assert_eq!(so.regex.as_deref(), Some("^[a-z]+$"));
+        assert!(so.json.is_none() && so.choice.is_none() && so.grammar.is_none());
+
+        // choice -> the choice field (the parsed list).
+        let so = map_grammar_type_to_structured_outputs("choice", "[\"a\",\"b\"]");
+        assert!(so.choice.is_some(), "choice maps to the choice field");
+        assert!(so.json.is_none() && so.regex.is_none() && so.grammar.is_none());
+
+        // lark (the default) + any unknown type -> the grammar field (the raw Lark).
+        let so = map_grammar_type_to_structured_outputs("lark", "start: \"hi\"");
+        assert_eq!(so.grammar.as_deref(), Some("start: \"hi\""));
+        let so = map_grammar_type_to_structured_outputs("unknown_type", "x");
+        assert_eq!(so.grammar.as_deref(), Some("x"), "unknown types fall back to the grammar field");
+    }
+
     #[test]
     fn reasoning_router_disabled_sends_all_as_content() {
         let (ctx, mut rx) = make_test_ctx();
@@ -2328,6 +2423,46 @@ mod tests {
     request_body = GrammarRequest,
     responses((status = 200, description = "Grammar-based completion"))
 )]
+/// Map the `grammar_type` to the `StructuredOutputs` field (the pure mapping the
+/// `/v1/grammar` endpoint uses). `json_schema` -> the json, `regex` -> the regex,
+/// `choice` -> the choice, + anything else (the `lark` default) -> the grammar.
+fn map_grammar_type_to_structured_outputs(
+    grammar_type: &str,
+    grammar: &str,
+) -> StructuredOutputs {
+    match grammar_type {
+        "json_schema" => StructuredOutputs {
+            choice: None,
+            regex: None,
+            json: serde_json::from_str(grammar).ok(),
+            grammar: None,
+            structural_tag: None,
+        },
+        "regex" => StructuredOutputs {
+            choice: None,
+            regex: Some(grammar.to_string()),
+            json: None,
+            grammar: None,
+            structural_tag: None,
+        },
+        "choice" => StructuredOutputs {
+            choice: serde_json::from_str(grammar).ok(),
+            regex: None,
+            json: None,
+            grammar: None,
+            structural_tag: None,
+        },
+        // "lark" (the default) + any other type -> the grammar field.
+        _ => StructuredOutputs {
+            choice: None,
+            regex: None,
+            json: None,
+            grammar: Some(grammar.to_string()),
+            structural_tag: None,
+        },
+    }
+}
+
 pub async fn grammar_completion(
     State(data): State<Arc<ServerData>>,
     request: Json<GrammarRequest>,
@@ -2344,8 +2479,40 @@ pub async fn grammar_completion(
         Err(e) => return ChatResponder::ValidationError(e.to_string()),
     };
 
-    // TODO: Wire grammar endpoint to chat_completion inference path
-    ChatResponder::ValidationError(
-        "/v1/grammar endpoint is not yet fully implemented. Use /v1/chat/completions with structured_outputs instead.".to_string()
-    )
+    // Map the grammar_type to the StructuredOutputs field (the pure mapping, the
+    // unit-testable without a live model).
+    let structured_outputs = map_grammar_type_to_structured_outputs(
+        &request.grammar_type,
+        &request.grammar,
+    );
+
+    // Convert the GrammarRequest to a ChatCompletionRequest + delegate to the
+    // chat_completion inference path (the shared streaming/tool/usage logic).
+    let chat_request = ChatCompletionRequest {
+        messages: request.messages.clone(),
+        model: None,
+        temperature: request.temperature,
+        max_tokens: request.max_tokens,
+        top_k: request.top_k,
+        top_p: request.top_p,
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
+        thinking: request.thinking,
+        stop: request.stop.clone(),
+        stream: Some(request.stream),
+        stream_options: None,
+        session_id: request.session_id.clone(),
+        tools: None,
+        tool_choice: None,
+        response_format: None,
+        extra_body: None,
+        structured_outputs: Some(structured_outputs),
+        constraint: None,
+        constraint_type: Some(request.grammar_type.clone()),
+        reasoning_effort: None,
+        reasoning_budget: None,
+    };
+
+    // Delegate to the shared chat path (the streaming, the tool parsing, the usage).
+    chat_completion(State(data), Json(chat_request)).await
 }

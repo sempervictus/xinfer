@@ -577,7 +577,7 @@ impl Qwen3_5ForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
         visual_pos_masks: &Option<Tensor>,
         deepstack_visual_embeds: &Option<Vec<Tensor>>,
         return_hidden: bool,
@@ -595,7 +595,7 @@ impl Qwen3_5ForCausalLM {
             input_metadata.is_prefill,
         );
 
-        let mut xs = if embeded_inputs {
+        let mut xs = if embedded_inputs {
             input_ids.to_owned()
         } else {
             self.embed_forward(input_ids)?
@@ -729,7 +729,7 @@ impl Qwen3_5ForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
         let mut none_layers = None;
         self.forward_inner(
@@ -737,7 +737,7 @@ impl Qwen3_5ForCausalLM {
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
             &None,
             &None,
             false,
@@ -752,7 +752,7 @@ impl Qwen3_5ForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
         let mut none_layers = None;
         self.forward_inner(
@@ -760,7 +760,7 @@ impl Qwen3_5ForCausalLM {
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
             &None,
             &None,
             true,
@@ -777,7 +777,7 @@ impl Qwen3_5ForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<(Tensor, Tensor)> {
         let mut none_layers = None;
         let hidden = self.forward_inner(
@@ -785,7 +785,7 @@ impl Qwen3_5ForCausalLM {
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
             &None,
             &None,
             true,
@@ -803,7 +803,7 @@ impl Qwen3_5ForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
         target_layer_ids: &[usize],
     ) -> Result<(Tensor, Vec<Tensor>)> {
         let mut collected_layers = None;
@@ -812,7 +812,7 @@ impl Qwen3_5ForCausalLM {
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
             &None,
             &None,
             false,
@@ -828,7 +828,7 @@ impl Qwen3_5ForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
         visual_pos_masks: &Option<Tensor>,
         deepstack_visual_embeds: &Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
@@ -838,7 +838,7 @@ impl Qwen3_5ForCausalLM {
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
             visual_pos_masks,
             deepstack_visual_embeds,
             false,

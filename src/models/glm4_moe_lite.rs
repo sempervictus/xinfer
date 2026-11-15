@@ -398,7 +398,7 @@ impl GLM4MoeLiteForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
         let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
         let attention_mask = get_attention_causal_mask(
@@ -410,7 +410,7 @@ impl GLM4MoeLiteForCausalLM {
             input_metadata.is_prefill,
         );
 
-        let mut xs = if embeded_inputs {
+        let mut xs = if embedded_inputs {
             input_ids.to_owned()
         } else {
             self.embed_forward(input_ids)?
@@ -453,14 +453,14 @@ impl GLM4MoeLiteForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
     ) -> Result<Tensor> {
         self.forward(
             input_ids,
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
         )
     }
 
@@ -470,7 +470,7 @@ impl GLM4MoeLiteForCausalLM {
         positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-        embeded_inputs: bool,
+        embedded_inputs: bool,
         _visual_pos_masks: &Option<Tensor>,
         _deepstack_visual_embeds: &Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
@@ -479,7 +479,7 @@ impl GLM4MoeLiteForCausalLM {
             positions,
             kv_caches,
             input_metadata,
-            embeded_inputs,
+            embedded_inputs,
         )
     }
 

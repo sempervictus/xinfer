@@ -3,7 +3,7 @@ use attention_rs::InputMetadata;
 use candle_core::{Result, Tensor};
 
 /// Per-sequence metadata used when building speculative verify batches.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SpecSeqInfo {
     pub id: usize,
     pub len: usize,
@@ -159,6 +159,125 @@ impl ModelRunner {
             max_seqlen_q: q_len,
             max_seqlen_k: seq_info.len + q_len,
             max_context_len: seq_info.len + q_len,
+            flashinfer_metadata,
+            is_mtp_verify: true,
+        })
+    }
+
+    /// The ff-span verify metadata (the KV-backed ff forward, the `run_ff_forward`).
+    /// Mirrors `build_verify_metadata` but the span starts at `seq.len + 1` (the base
+    /// token is at `seq.len`, already written by the prior decode forward); the ff
+    /// span is `[ff_0..ff_n]` at positions `[seq.len+1, seq.len+1+ff_len)`. The
+    /// `total_kv_len` is `seq.len + 1 + ff_len` (the base + the ff span, the attention
+    /// over the ff positions reads the full context including the base).
+    pub(crate) fn build_ff_metadata(
+        &self,
+        seq_info: &SpecSeqInfo,
+        slot_mappings: &[i64],
+        ff_len: usize,
+    ) -> Result<InputMetadata> {
+        let base_offset = 1; // the base token is at seq.len (the prior decode wrote it)
+        let total_kv_len = (seq_info.len + base_offset + ff_len) as u32;
+        let mamba_slot_mapping = self.prepare_mamba_slot_mapping(&[seq_info.id], false)?;
+
+        #[cfg(feature = "flashinfer")]
+        let flashinfer_metadata = if let Some(params) = self.flashinfer_kv_params() {
+            let num_pages = (total_kv_len as usize).div_ceil(params.page_size);
+            if num_pages > seq_info.block_table.len() {
+                candle_core::bail!(
+                    "ff forward needs {} KV pages for {} tokens, but only {} pages are allocated",
+                    num_pages,
+                    total_kv_len,
+                    seq_info.block_table.len()
+                );
+            }
+            let indptr_host = vec![0u32, num_pages as u32];
+            let indices_vec = seq_info.block_table[..num_pages].to_vec();
+            let last_page_tokens = if total_kv_len == 0 {
+                0
+            } else {
+                (total_kv_len as usize - 1) % params.page_size + 1
+            };
+            let last_len_host = vec![last_page_tokens as u32];
+            let kv_len_arr_host = vec![total_kv_len];
+            let q_cu_seqlens_host = vec![0u32, ff_len as u32];
+            let batch_indices = Tensor::zeros((ff_len,), candle_core::DType::U32, self.device())?;
+            // The ff span positions: [seq.len+1, seq.len+1+ff_len) (the base is at seq.len).
+            let append_positions = Tensor::from_vec(
+                ((seq_info.len + base_offset)..(seq_info.len + base_offset + ff_len))
+                    .map(|p| p as u32)
+                    .collect::<Vec<_>>(),
+                (ff_len,),
+                self.device(),
+            )?;
+
+            let prefill_plan_info = Some(attention_rs::flashinfer::prefill_plan(
+                self.device(),
+                &q_cu_seqlens_host,
+                &indptr_host,
+                &kv_len_arr_host,
+                ff_len as u32,
+                1,
+                params.num_qo_heads,
+                params.num_kv_heads,
+                params.head_dim,
+                params.page_size,
+                params.out_dtype,
+                None,
+                Some(params.kv_dtype),
+                false,
+            )?);
+
+            Some(attention_rs::FlashInferMetadata {
+                indptr: Tensor::from_vec(indptr_host.clone(), (2,), self.device())?,
+                indptr_host,
+                indices: Tensor::from_vec(indices_vec, (num_pages,), self.device())?,
+                last_len: Tensor::from_vec(last_len_host.clone(), (1,), self.device())?,
+                last_len_host: Some(last_len_host),
+                kv_len_arr_host: Some(kv_len_arr_host),
+                total_num_rows: Some(ff_len as u32),
+                batch_indices: Some(batch_indices),
+                positions: Some(append_positions),
+                use_cuda_graph: false,
+                decode_plan_info: None,
+                prefill_plan_info,
+                mla_decode_plan_info: None,
+                mla_prefill_plan_info: None,
+            })
+        } else {
+            None
+        };
+        #[cfg(not(feature = "flashinfer"))]
+        let flashinfer_metadata = None;
+
+        Ok(InputMetadata {
+            is_prefill: true,
+            is_mla: self.is_mla_model(),
+            sequence_ids: Some(vec![seq_info.id]),
+            mamba_slot_mapping,
+            slot_mapping: Tensor::from_vec(slot_mappings.to_vec(), (ff_len,), self.device())?,
+            context_lens: Some(Tensor::from_vec(vec![total_kv_len], (1,), self.device())?),
+            block_tables: Some(Tensor::from_vec(
+                seq_info.block_table.clone(),
+                (1, seq_info.block_table.len()),
+                self.device(),
+            )?),
+            block_tables_host: Some(vec![seq_info.block_table.clone()]),
+            context_lens_host: Some(vec![total_kv_len]),
+            seqlens: None,
+            cu_seqlens_q: Some(Tensor::from_vec(
+                vec![0u32, ff_len as u32],
+                (2,),
+                self.device(),
+            )?),
+            cu_seqlens_k: Some(Tensor::from_vec(
+                vec![0u32, total_kv_len],
+                (2,),
+                self.device(),
+            )?),
+            max_seqlen_q: ff_len,
+            max_seqlen_k: seq_info.len + base_offset + ff_len,
+            max_context_len: seq_info.len + base_offset + ff_len,
             flashinfer_metadata,
             is_mtp_verify: true,
         })

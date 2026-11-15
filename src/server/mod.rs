@@ -111,6 +111,15 @@ pub struct ChatCompletionRequest {
     /// Values: "none", "low", "medium", "high", or "xhigh".
     #[serde(default, alias = "reasoning")]
     pub reasoning_effort: Option<String>,
+    /// The reasoning token budget (the max reasoning tokens before the model is
+    /// steered to the end-of-reasoning token). When set, the runner applies a
+    /// sampling bias to the end-of-reasoning token that ramps up as the
+    /// reasoning count approaches this budget (the smooth transition, not the
+    /// hard grammar cutoff). The `None` means no budget (the unbounded
+    /// reasoning, the prior behavior). Aliased as `thinking_budget` for the
+    /// OpenAI-compatible clients.
+    #[serde(default, alias = "thinking_budget")]
+    pub reasoning_budget: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,6 +284,18 @@ pub struct ResponseFormat {
     pub format_type: String,
     #[serde(default)]
     pub json_schema: Option<ResponseFormatJsonSchema>,
+    /// The regex pattern (the `response_format.type == "regex"`).
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// The allowed choices (the `response_format.type == "choice"`).
+    #[serde(default)]
+    pub choices: Option<Vec<String>>,
+    /// The raw grammar body (the `response_format.type == "grammar"`).
+    #[serde(default)]
+    pub grammar: Option<String>,
+    /// The grammar dialect (the `lark` default).
+    #[serde(default)]
+    pub grammar_type: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -937,6 +958,11 @@ pub struct Args {
     /// Enable grammar-based generation: tool grammar, structured outputs, and client constraints
     #[arg(long, default_value = "false")]
     pub enable_tool_grammar: bool,
+
+    /// Path to a user-defined reasoning-grammar YAML file (the levels map to inner
+    /// Lark expressions). Loaded into the global registry at startup.
+    #[arg(long, default_value = None)]
+    pub reasoning_grammars: Option<String>,
 }
 
 impl Args {
@@ -2084,7 +2110,9 @@ mod tests {
             reasoning_end_ids: vec![102],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            newline_tokens: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
@@ -2106,7 +2134,9 @@ mod tests {
             reasoning_end_ids: Vec::new(),
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            newline_tokens: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
@@ -2127,7 +2157,9 @@ mod tests {
             reasoning_end_ids: vec![102],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            newline_tokens: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);

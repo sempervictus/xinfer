@@ -170,10 +170,10 @@ macro_rules! model_call {
 #[cfg(all(feature = "cuda", feature = "graph"))]
 #[macro_export]
 macro_rules! graph_extra_arg {
-    (EmbedInputs, $embeded_inputs:ident) => {
-        $embeded_inputs
+    (EmbedInputs, $embedded_inputs:ident) => {
+        $embedded_inputs
     };
-    (NoneArg, $embeded_inputs:ident) => {
+    (NoneArg, $embedded_inputs:ident) => {
         None
     };
 }
@@ -191,13 +191,13 @@ macro_rules! graph_wrapper {
                                     positions: &Tensor,
                                     kv_caches: Option<&Vec<(Tensor, Tensor)>>,
                                     input_metadata: &InputMetadata,
-                                    embeded_inputs: bool| {
+                                    _embedded_inputs: bool| {
                     model_arc.forward(
                         input_ids,
                         positions,
                         kv_caches,
                         input_metadata,
-                        crate::graph_extra_arg!($arg, embeded_inputs),
+                        crate::graph_extra_arg!($arg, _embedded_inputs),
                     )
                 };
                 let boxed_closure: Box<ModelFn> = Box::new(closure);

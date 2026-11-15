@@ -6,6 +6,7 @@ use crate::speculative::metadata::SpecSeqInfo;
 use crate::speculative::spec_stats::{spec_seq_next_k, spec_stats_update};
 use crate::speculative::verify::{mtp_stats_summary, mtp_stats_update, verify_draft_greedy, verify_draft_rejection};
 use crate::utils::env::{spec_draft_mask, spec_rejection_sampling};
+use crate::utils::guidance::OutputPhase;
 use crate::utils::guided_decoding::apply_vob_to_logits_row;
 use crate::utils::logits_processor::{LogitsProcessor, Sampling};
 use candle_core::{Result, Tensor};
@@ -178,7 +179,16 @@ impl ModelRunner {
     ///   4. Verify: run main model on [anchor, draft_0, ..., draft_{K-1}] using native flash
     ///   5. On partial rejection: roll back GDN state to the accepted token boundary
     ///   6. Greedy-accept matching prefix; take bonus token at first mismatch
-    pub fn run_mtp_decode(&self, seqs: Seqs) -> Result<Vec<SpecStepOut>> {
+pub fn run_mtp_decode(&self, seqs: Seqs) -> Result<Vec<SpecStepOut>> {
+        // The engine-stamped reasoning count (the no the optional GuidanceState,
+        // which is not populated on the MTP path).
+        if let Seqs::DecodeVec(decode_seqs) = &seqs {
+            for ds in decode_seqs.iter() {
+                let eor = ds.sampling_params.guidance_reasoning_end_ids.first().copied().unwrap_or(0);
+                let newline = ds.sampling_params.guidance_newline_tokens.clone();
+                self.guided_decoding().set_reasoning_count(ds.id, ds.reasoning_token_count, eor, newline);
+            }
+        }
         let mtp_head = match &self.mtp_head {
             Some(h) => h.clone(),
             None => {
@@ -232,7 +242,26 @@ impl ModelRunner {
         // the ceiling, but it can never grow it past the captured graph size.
         // The k=0 case (the SD not enabled for this seq) falls back to the plain
         // decode (the no verify).
-        let num_draft = seq_info.k.min(self.mtp_num_speculative);
+        let mut num_draft = seq_info.k.min(self.mtp_num_speculative);
+        // The reasoning-budget suppression: when the sequence is still in the
+        // `Reasoning` region + the budget is exhausted (the count >= the
+        // XINFER_MAX_REASONING_TOKENS), suppress the drafts (the num_draft = 0)
+        // so the step produces only the forced anchor (the end-of-reasoning
+        // token, the gate injection). The reasoning region terminates at the
+        // budget. The `phase == Reasoning` guard scopes this to the reasoning
+        // region only — once the EOR is injected the phase moves to `Text` and
+        // drafts resume for the answer region (not suppressing throughput
+        // for the whole generation).
+        if num_draft > 0
+            && self.guided_decoding().phase(seq_info.id) == OutputPhase::Reasoning
+            && self.guided_decoding().reasoning_budget_exhausted(seq_info.id)
+        {
+            crate::log_info!(
+                "[reasoning-bias] seq {}: budget exhausted, suppressing MTP drafts (num_draft {} -> 0) to force the end-of-reasoning token",
+                seq_info.id, num_draft
+            );
+            num_draft = 0;
+        }
         if num_draft == 0 {
             // The SD not enabled for this seq (the k=0): the plain decode fallback,
             // the no speculative K (the next_k = 0).
@@ -414,23 +443,29 @@ impl ModelRunner {
             drop(kv_cache);
             res
         };
-        let all_logits = all_logits_result?;
+let all_logits = all_logits_result?;
 
+        // The MTP drafter proposes from its own logits; grammar-illegal drafts are
+        // rejected by the verify step (the target-logits comparison in
+        // verify_draft_greedy / verify_draft_rejection), not by a draft-position mask.
+        let masked_all_logits = all_logits.clone();
         // The verify: the greedy argmax accept (the default) OR the lossless
         // rejection sampling (the XINFER_SPEC_REJECTION_SAMPLING, the target's
         // sampled distribution honored, the no biased output at temperature > 0).
+        // The rejection path uses the target logits; grammar-illegal drafts are
+        // rejected by the min(1, p_target/p_draft) accept test + the residual draw.
         let verify_result = if spec_rejection_sampling() {
-            // The lossless rejection sampling (the target's sampled distribution
-            // honored, the no biased output at temperature > 0). The `p_target` is
-            // the target's post-sampling distribution per verify position (the
-            // sampler's transform, the exact distribution the normal decode would
-            // sample from); the `p_draft` is the drafter's per-position softmax.
+            // The lossless rejection sampling. The `p_target` is the target's
+            // post-sampling distribution per verify position (the sampler's
+            // transform over the MASKED logits, the exact distribution the normal
+            // decode would sample from); the `p_draft` is the drafter's per-position
+            // softmax.
             let sampling = self
                 .cached_sampling()
                 .map(|c| c.sampling)
                 .unwrap_or(Sampling::ArgMax);
             let processor = LogitsProcessor::from_sampling(0, sampling);
-            let vflat: Vec<f32> = all_logits
+            let vflat: Vec<f32> = masked_all_logits
                 .to_dtype(candle_core::DType::F32)?
                 .flatten_all()?
                 .to_vec1()?;
@@ -509,7 +544,7 @@ impl ModelRunner {
             let seed = (seq_info.id as u64).wrapping_mul(0x9E3779B97F4A7C15);
             verify_draft_rejection(&target_probs_tensor, &draft_probs_tensor, &draft_tokens, seed)?
         } else {
-            verify_draft_greedy(&all_logits, &draft_tokens)?
+            verify_draft_greedy(&masked_all_logits, &draft_tokens)?
         };
 
         if verify_result.num_accepted < verify_result.num_proposed {
@@ -595,10 +630,27 @@ impl ModelRunner {
             // The per-seq K: draft `seq_info.k` tokens (the no fixed ceiling). The
             // verify below uses the batch-max K (the uniform q_len for the one
             // attention pass), but each seq drafts its own dynamic length.
+            // The reasoning-budget suppression: when the sequence is still in the
+            // `Reasoning` region + the budget is exhausted for this seq (the count >=
+            // the XINFER_MAX_REASONING_TOKENS), draft 0 tokens (the anchor only, the
+            // forced end-of-reasoning token). The `phase == Reasoning` guard scopes
+            // this to the reasoning region only.
+            let k = if seq_info.k > 0
+                && self.guided_decoding().phase(seq_info.id) == OutputPhase::Reasoning
+                && self.guided_decoding().reasoning_budget_exhausted(seq_info.id)
+            {
+                crate::log_info!(
+                    "[reasoning-bias] seq {}: budget exhausted, suppressing MTP drafts (k {} -> 0) to force the end-of-reasoning token",
+                    seq_info.id, seq_info.k
+                );
+                0
+            } else {
+                seq_info.k
+            };
             let (draft, _last_hidden, _draft_logits) = mtp_head.draft_tokens_gpu(
                 &seq_hidden,
                 &anchor_tensor,
-                seq_info.k,
+                k,
                 &embed_weight,
                 &lm_head_fn,
                 base_position,
@@ -697,7 +749,10 @@ impl ModelRunner {
         for (index, (seq_info, draft)) in seq_infos.iter().zip(&draft_tokens).enumerate() {
             let offset = index * verify_len;
             let logits = all_logits.narrow(0, offset, verify_len)?;
-            let verify_result = verify_draft_greedy(&logits, draft)?;
+            // The MTP drafter proposes from its own logits; grammar-illegal drafts
+            // are rejected by the verify step, not by a draft-position mask.
+            let masked_logits = logits.clone();
+            let verify_result = verify_draft_greedy(&masked_logits, draft)?;
             if verify_result.num_accepted < verify_result.num_proposed {
                 let keep_tokens = 1 + verify_result.num_accepted;
                 if !self.rollback_mamba_at(seq_info.id, keep_tokens, offset)? {
